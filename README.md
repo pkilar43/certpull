@@ -73,7 +73,7 @@ Give it a static or reserved IP — otherwise rebuilding the machine means
 changing the A record in the parent zone.
 
 ```bash
-git clone <repo> /opt/certpull && cd /opt/certpull/server
+git clone https://github.com/pkilar43/certpull.git /opt/certpull && cd /opt/certpull/server
 ./install-server.sh acme.example.com ns-certpull.example.com pki@example.com
 ```
 
@@ -123,6 +123,7 @@ _acme-challenge.www.app.example.com.  300 IN CNAME www.app.example.com.acme.exam
 On the LAN machine:
 
 ```bash
+git clone https://github.com/pkilar43/certpull.git /opt/certpull
 cd /opt/certpull/agent
 ./install-agent.sh srv-web-01
 ```
