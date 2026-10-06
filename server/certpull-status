@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# certpull-status -- overview of every host: domains, days until expiry,
+# whether the published copy matches lego's store, and when it was published.
+set -euo pipefail
+
+CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
+# shellcheck source=/dev/null
+source "$CONF"
+: "${HOSTS_DIR:=/etc/certpull/hosts.d}" "${LEGO_DIR:=/var/lib/certpull/lego}"
+: "${PULL_DIR:=/var/lib/certpull/pull}" "${RENEW_DAYS:=15}"
+
+stem_of() { local d="$1"; if [[ $d == \*.* ]]; then d="_.${d#*.}"; fi; printf '%s' "$d"; }
+
+printf '%-22s %-8s %-6s %-10s %s\n' HOST STATE DAYS PUBLISHED DOMAINS
+printf '%-22s %-8s %-6s %-10s %s\n' '----' '-----' '----' '---------' '-------'
+
+shopt -s nullglob
+for f in "$HOSTS_DIR"/*.conf; do
+  hostid=$(basename "$f" .conf)
+  DOMAINS=""; ENABLED="yes"
+  # shellcheck source=/dev/null
+  source "$f"
+  crt="$LEGO_DIR/certificates/$(stem_of "${DOMAINS%% *}").crt"
+
+  if [[ -s $crt ]]; then
+    end=$(openssl x509 -in "$crt" -noout -enddate | cut -d= -f2-)
+    days=$(( ( $(date -u -d "$end" +%s) - $(date -u +%s) ) / 86400 ))
+  else
+    days="-"
+  fi
+
+  pub="none"
+  if [[ -s $PULL_DIR/$hostid/meta.json ]]; then
+    pub=$(date -u -d "@$(stat -c %Y "$PULL_DIR/$hostid/meta.json")" +%F)
+  fi
+
+  state="ok"
+  if [[ ${ENABLED,,} != yes ]]; then state="off"
+  elif [[ $days == "-" ]]; then state="MISSING"
+  elif (( days < 0 )); then state="EXPIRED"
+  elif (( days <= RENEW_DAYS )); then state="renew"
+  fi
+
+  printf '%-22s %-8s %-6s %-10s %s\n' "$hostid" "$state" "$days" "$pub" "$DOMAINS"
+done

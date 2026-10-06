@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# certpull-host -- host management on the server side.
+#
+#   certpull-host add <hostid> <domain> [domain...]    add a host + show CNAMEs
+#   certpull-host cname <hostid>                       show the records to paste
+#   certpull-host key <hostid>[,<hostid>...] '<key>'   authorise an agent key
+#                                                      (reusing it overwrites the list)
+#   certpull-host del <hostid>                         remove a host (conf, key, pull)
+#   certpull-host list                                 hosts and their domains
+#   certpull-host keys                                 keys and what they may fetch
+#   certpull-host doctor                               diagnose the SSH account
+set -euo pipefail
+
+CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
+# shellcheck source=/dev/null
+source "$CONF"
+: "${HOSTS_DIR:=/etc/certpull/hosts.d}" "${PULL_DIR:=/var/lib/certpull/pull}"
+: "${ACME_ZONE:?}" "${DEFAULT_KEY_TYPE:=ec256}"
+GLOBAL_ACME_ZONE="$ACME_ZONE"
+
+AUTHKEYS="/var/lib/certpull/.ssh/authorized_keys"
+SHELLBIN="/usr/local/lib/certpull/certpull-pull-shell"
+
+usage() { sed -n '3,13p' "$0"; exit 2; }
+die()   { echo "certpull-host: $*" >&2; exit 1; }
+
+valid_id() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "a hostid may only contain [a-z0-9._-]"; }
+
+cmd="${1:-}"; shift || usage
+
+case "$cmd" in
+
+add)
+  zone_override=""
+  if [[ ${1:-} == --zone ]]; then zone_override="${2:-}"; shift 2; fi
+  hostid="${1:-}"; shift || usage
+  valid_id "$hostid"
+  (($#)) || die "give at least one domain"
+  if [[ -e $HOSTS_DIR/$hostid.conf ]]; then die "$hostid already exists"; fi
+  mkdir -p "$HOSTS_DIR"
+  cat > "$HOSTS_DIR/$hostid.conf" <<EOF
+DOMAINS="$*"
+KEY_TYPE=""
+RENEW_DAYS=""
+ENABLED="yes"
+# The zone this host's _acme-challenge CNAME points into.
+# Empty = ACME_ZONE from /etc/certpull/certpull.conf
+ACME_ZONE="$zone_override"
+EOF
+  chmod 0644 "$HOSTS_DIR/$hostid.conf"
+  echo "created $HOSTS_DIR/$hostid.conf"
+  echo
+  exec "$0" cname "$hostid"
+  ;;
+
+cname)
+  hostid="${1:-}"; valid_id "$hostid"
+  [[ -r $HOSTS_DIR/$hostid.conf ]] || die "no $HOSTS_DIR/$hostid.conf"
+  DOMAINS=""; ACME_ZONE=""
+  # shellcheck source=/dev/null
+  source "$HOSTS_DIR/$hostid.conf"
+  zone="${ACME_ZONE:-$GLOBAL_ACME_ZONE}"
+  echo "Paste into the public zones (once; nothing changes afterwards):"
+  echo
+  for d in $DOMAINS; do
+    base="${d#\*.}"
+    printf '  _acme-challenge.%s.\t300\tIN\tCNAME\t%s.%s.\n' "$base" "$base" "$zone"
+  done
+  echo
+  echo "Verify once propagated:"
+  for d in $DOMAINS; do
+    base="${d#\*.}"
+    printf '  dig +short CNAME _acme-challenge.%s\n' "$base"
+  done
+  ;;
+
+key)
+  # certpull-host key <hostid>[,<hostid>...] "<public key>"
+  # If the key is already in authorized_keys, its hostid list is OVERWRITTEN
+  # with the value given here -- that is how access to further certificates is
+  # granted and revoked.
+  ids_raw="${1:-}"; [[ -n $ids_raw ]] || usage
+  pub="${2:-}"; [[ -n $pub ]] || die "pass the public key in quotes"
+
+  IFS=', ' read -r -a ids <<<"$ids_raw"
+  ((${#ids[@]})) || die "empty hostid list"
+  for h in "${ids[@]}"; do
+    valid_id "$h"
+    [[ -r $HOSTS_DIR/$h.conf ]] || die "first run: certpull-host add $h <domains>"
+  done
+
+  # keep only type+base64 (drop any trailing comment)
+  read -r ktype kdata _ <<<"$pub"
+  [[ $ktype =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa|sk-ssh-ed25519@openssh\.com)$ ]] \
+    || die "unsupported key type: $ktype"
+
+  mkdir -p "$(dirname "$AUTHKEYS")"; touch "$AUTHKEYS"
+  newline=$(printf 'restrict,command="%s %s" %s %s certpull-%s' \
+              "$SHELLBIN" "${ids[*]}" "$ktype" "$kdata" "${ids[0]}")
+
+  tmp=$(mktemp); found=0; old=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *" $kdata"* ]]; then
+      found=1
+      old="${line#*certpull-pull-shell }"; old="${old%%\"*}"
+      printf '%s\n' "$newline" >> "$tmp"
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$AUTHKEYS"
+  if (( ! found )); then printf '%s\n' "$newline" >> "$tmp"; fi
+  cat "$tmp" > "$AUTHKEYS"; rm -f "$tmp"
+
+  chown -R certpull:certpull "$(dirname "$AUTHKEYS")"
+  chmod 0700 "$(dirname "$AUTHKEYS")"; chmod 0600 "$AUTHKEYS"
+  if (( found )); then
+    echo "updated an existing key: [$old] -> [${ids[*]}]"
+  else
+    echo "added a key with access to: ${ids[*]}"
+  fi
+  ;;
+
+del)
+  hostid="${1:-}"; valid_id "$hostid"
+  rm -f "$HOSTS_DIR/$hostid.conf"
+  rm -rf "${PULL_DIR:?}/$hostid"
+  # drop the hostid from the lists in authorized_keys; remove the whole line
+  # only once its list becomes empty
+  if [[ -s $AUTHKEYS ]]; then
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line != *"certpull-pull-shell "* ]]; then
+        printf '%s\n' "$line" >> "$tmp"; continue
+      fi
+      head="${line%%certpull-pull-shell *}"
+      rest="${line#*certpull-pull-shell }"
+      ids_str="${rest%%\"*}"; tail_str="${rest#*\"}"
+      keep=()
+      for h in $ids_str; do if [[ $h != "$hostid" ]]; then keep+=( "$h" ); fi; done
+      if ((${#keep[@]})); then
+        printf '%scertpull-pull-shell %s"%s\n' "$head" "${keep[*]}" "$tail_str" >> "$tmp"
+      fi
+    done < "$AUTHKEYS"
+    cat "$tmp" > "$AUTHKEYS"; rm -f "$tmp"
+    chmod 0600 "$AUTHKEYS"
+  fi
+  echo "removed $hostid (the certificate stays in lego's store -- delete it by hand if needed)"
+  ;;
+
+list)
+  shopt -s nullglob
+  for f in "$HOSTS_DIR"/*.conf; do
+    hostid=$(basename "$f" .conf); DOMAINS=""; ENABLED="yes"
+    # shellcheck source=/dev/null
+    source "$f"
+    haskey=no
+    if grep -qE "certpull-pull-shell [^\"]*\b${hostid//./\\.}\b" "$AUTHKEYS" 2>/dev/null; then haskey=yes; fi
+    printf '%-22s enabled=%-4s key=%-4s %s\n' "$hostid" "$ENABLED" "$haskey" "$DOMAINS"
+  done
+  ;;
+
+doctor)
+  # checks everything that must be true for an agent to be able to log in
+  rc=0
+  ok()   { printf '  [ OK ] %s\n' "$*"; }
+  bad()  { printf '  [FAIL] %s\n' "$*"; rc=1; }
+  warn() { printf '  [ ?? ] %s\n' "$*"; }
+
+  echo "certpull account:"
+  if ! id -u certpull >/dev/null 2>&1; then
+    bad "user certpull does not exist"
+  else
+    ok "user exists"
+    sh=$(getent passwd certpull | cut -d: -f7)
+    case "$sh" in
+      */nologin|*/false)
+        bad "the shell is $sh -- sshd runs the forced command through the login shell,"
+        echo "         so nologin kills the connection with"
+        echo "         'This account is currently not available.' before pull-shell starts."
+        echo "         fix:  usermod -s /bin/bash certpull" ;;
+      "") bad "no shell in /etc/passwd" ;;
+      *)  if [[ -x $sh ]]; then ok "shell $sh"; else bad "shell $sh is missing or not executable"; fi ;;
+    esac
+    hd=$(getent passwd certpull | cut -d: -f6)
+    [[ -d $hd ]] && ok "home directory $hd" || bad "home directory $hd is missing"
+  fi
+
+  echo "authorized_keys:"
+  if [[ ! -s $AUTHKEYS ]]; then
+    warn "$AUTHKEYS is empty or missing -- no agent will be able to log in"
+  else
+    ok "$AUTHKEYS ($(grep -c 'certpull-pull-shell' "$AUTHKEYS" 2>/dev/null || echo 0) keys)"
+    p=$(stat -c '%a %U:%G' "$AUTHKEYS")
+    [[ $p == "600 certpull:certpull" ]] && ok "permissions $p" || bad "permissions $p (expected 600 certpull:certpull)"
+    pd=$(stat -c '%a %U:%G' "$(dirname "$AUTHKEYS")")
+    [[ $pd == "700 certpull:certpull" ]] && ok ".ssh directory $pd" || bad ".ssh directory $pd (expected 700 certpull:certpull)"
+  fi
+
+  echo "forced command:"
+  if [[ -x $SHELLBIN ]]; then ok "$SHELLBIN"; else bad "$SHELLBIN is missing or not executable"; fi
+
+  echo "sshd:"
+  if sshd -T -C "user=certpull,host=localhost,addr=127.0.0.1" >/dev/null 2>&1; then
+    akf=$(sshd -T -C "user=certpull,host=localhost,addr=127.0.0.1" 2>/dev/null | awk '/^authorizedkeysfile/{print $2}')
+    ok "configuration parses; authorizedkeysfile=${akf:-?}"
+  else
+    warn "cannot query sshd -T (run as root)"
+  fi
+
+  echo "pull directory:"
+  if [[ -d $PULL_DIR ]]; then
+    n=$(find "$PULL_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    ok "$PULL_DIR ($n published certificates)"
+  else
+    bad "$PULL_DIR is missing"
+  fi
+
+  echo
+  if (( rc )); then echo "There are problems -- fix the above."; else echo "All good."; fi
+  exit "$rc"
+  ;;
+
+keys)
+  # who has access to what
+  [[ -s $AUTHKEYS ]] || { echo "(no keys)"; exit 0; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"certpull-pull-shell "* ]] || continue
+    rest="${line#*certpull-pull-shell }"; ids_str="${rest%%\"*}"
+    comment="${line##* }"
+    printf '%-28s -> %s\n' "$comment" "$ids_str"
+  done < "$AUTHKEYS"
+  ;;
+
+*) usage ;;
+esac

@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# certpull-issue -- issues/renews certificates for the hosts in
+# /etc/certpull/hosts.d and publishes them into the pull directory, from which
+# the agents fetch them over SSH.
+#
+#   certpull-issue                  -> walk every host
+#   certpull-issue srv-web-01       -> this host only
+#   certpull-issue --force srv-...  -> renew regardless of remaining lifetime
+#   certpull-issue --dry-run        -> show what it would do
+#   certpull-issue --preflight      -> only check the DNS delegation, skip lego
+#   certpull-issue --skip-preflight -> skip the DNS check (not recommended)
+set -Eeuo pipefail
+
+CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
+LOCK="/run/lock/certpull-issue.lock"
+
+[[ -r $CONF ]] || { echo "$CONF is missing" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$CONF"
+
+: "${ACME_EMAIL:?}" "${ACME_SERVER:?}" "${ACME_ZONE:?}" "${DNS_SERVER:?}"
+: "${TSIG_FILE:?}" "${HOSTS_DIR:?}" "${LEGO_DIR:?}" "${PULL_DIR:?}"
+: "${RENEW_DAYS:=15}" "${DEFAULT_KEY_TYPE:=ec256}" "${DNS_PORT:=53}"
+: "${PROPAGATION_WAIT:=0}" "${LOG_TAG:=certpull}"
+
+GLOBAL_RENEW_DAYS="$RENEW_DAYS"
+GLOBAL_KEY_TYPE="$DEFAULT_KEY_TYPE"
+GLOBAL_ACME_ZONE="$ACME_ZONE"
+
+FORCE=0; DRY=0; ONLY=""; SKIP_PRE=0; PREONLY=0
+while (($#)); do
+  case "$1" in
+    --force)          FORCE=1 ;;
+    --dry-run)        DRY=1 ;;
+    --preflight)      PREONLY=1 ;;
+    --skip-preflight) SKIP_PRE=1 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -*)        echo "unknown option: $1" >&2; exit 2 ;;
+    *)         ONLY="$1" ;;
+  esac
+  shift
+done
+
+log()  { printf '%s\n' "$*" >&2; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+fail() { log "ERROR: $*"; }
+
+notify() {  # $1=hostid  $2=message
+  if [[ -n ${NOTIFY_CMD:-} ]]; then "$NOTIFY_CMD" "$1" "$2" || true; fi
+}
+
+# --- single instance --------------------------------------------------------
+mkdir -p "$(dirname "$LOCK")"
+exec 9>"$LOCK"
+flock -n 9 || { log "another certpull-issue instance is already running"; exit 0; }
+
+# --- TSIG -------------------------------------------------------------------
+# TSIG_FILE holds: TSIG_NAME= / TSIG_ALG= / TSIG_SECRET=
+# shellcheck source=/dev/null
+source "$TSIG_FILE"
+: "${TSIG_NAME:?}" "${TSIG_ALG:?}" "${TSIG_SECRET:?}"
+
+export RFC2136_NAMESERVER="${DNS_SERVER}:${DNS_PORT}"
+export RFC2136_TSIG_KEY="$TSIG_NAME"
+export RFC2136_TSIG_ALGORITHM="$TSIG_ALG"
+export RFC2136_TSIG_SECRET="$TSIG_SECRET"
+export RFC2136_TTL="60"
+export RFC2136_PROPAGATION_TIMEOUT="180"
+export RFC2136_POLLING_INTERVAL="5"
+# By default lego follows the CNAME of the _acme-challenge record -- the whole
+# delegation rests on that, so LEGO_DISABLE_CNAME_SUPPORT must stay unset.
+unset LEGO_DISABLE_CNAME_SUPPORT 2>/dev/null || true
+
+# lego resolves the CNAME and checks propagation using recursive resolvers.
+# Those must NOT be the ones from /etc/resolv.conf if somebody put 127.0.0.1
+# there -- Knot is authoritative, not recursive, and answers REFUSED, which
+# makes lego conclude there is no CNAME and start updating the original name
+# instead. Hence we pass them explicitly.
+: "${DNS_RESOLVERS:=8.8.8.8:53,9.9.9.9:53}"
+RESOLVER1="${DNS_RESOLVERS%%,*}"; RESOLVER1="${RESOLVER1%%:*}"
+
+mkdir -p "$LEGO_DIR" "$PULL_DIR"
+chmod 0700 "$LEGO_DIR"
+chmod 0711 "$PULL_DIR"
+
+# --- helpers ----------------------------------------------------------------
+lego_file_stem() {           # first domain -> the file name lego uses
+  local d="$1"
+  if [[ $d == \*.* ]]; then d="_.${d#*.}"; fi
+  printf '%s' "$d"
+}
+
+check_zone_transaction() {   # $1 = zone ; 0 = free
+  # An open transaction (knotc zone-begin without commit/abort) BLOCKS dynamic
+  # updates to that zone. Knot does not reject them with an error -- it simply
+  # does not answer, so all lego sees is "DNS update failed: i/o timeout" with
+  # no way to guess the cause. Happens after an interrupted zone-begin.
+  command -v knotc >/dev/null || return 0
+  local st
+  st=$(knotc zone-status "$1" +transaction 2>/dev/null || true)
+  if [[ $st == *open* ]]; then
+    fail "$1: the zone has an OPEN TRANSACTION -- dynamic updates are blocked"
+    echo "     lego will only report 'DNS update failed: i/o timeout'." >&2
+    echo "     fix:  knotc zone-abort $1     (or zone-commit, if the change was intended)" >&2
+    return 1
+  fi
+  return 0
+}
+
+preflight_domain() {         # $1 = domain (may be *.foo) ; 0 = ready to validate
+  local d="${1#\*.}" chall target resp st aa=0
+  chall="_acme-challenge.${d}"
+
+  target=$(dig +short +time=3 +tries=2 "@$RESOLVER1" CNAME "$chall" 2>/dev/null | head -1)
+  if [[ -z $target ]]; then
+    fail "$chall: no CNAME record (as seen by $RESOLVER1)"
+    echo "     add:  $chall.  300 IN CNAME  ${d}.${ACME_ZONE}." >&2
+    return 1
+  fi
+
+  # Does the CNAME target live in a zone our Knot serves?
+  # The AA FLAG decides this, not the status. The target name itself almost
+  # never exists (the TXT lives only for the brief moment of validation), so
+  # NXDOMAIN with aa set is the correct, expected result. REFUSED, or a missing
+  # aa flag, means this server is not authoritative for that zone.
+  resp=$(dig "@$DNS_SERVER" -p "$DNS_PORT" +noall +comments +time=3 +tries=2 SOA "$target" 2>/dev/null)
+  st=$(printf '%s' "$resp" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)
+  if printf '%s' "$resp" | grep -qE '^;; flags:[^;]* aa[ ;]'; then aa=1; fi
+
+  if [[ $st == REFUSED ]]; then
+    fail "$chall -> $target : this server is not authoritative for the CNAME target"
+    echo "     the target must live in one of these zones:  certpull-zone list" >&2
+    return 1
+  fi
+  if (( aa )) && [[ $st == NOERROR || $st == NXDOMAIN ]]; then
+    return 0
+  fi
+  fail "$chall -> $target : Knot answered ${st:-no response}$( ((aa)) || printf ' without the aa flag' )"
+  echo "     check:  dig @$DNS_SERVER SOA $target   and   certpull-zone list" >&2
+  return 1
+}
+
+tsig_keyfile() {             # creates the TSIG key file on demand; the secret never reaches argv
+  [[ -n ${KEYFILE:-} ]] && return 0
+  KEYFILE=$(mktemp); chmod 0600 "$KEYFILE"
+  cat > "$KEYFILE" <<EOF
+key "${TSIG_NAME%.}." {
+    algorithm ${TSIG_ALG%.};
+    secret "${TSIG_SECRET}";
+};
+EOF
+  trap 'rm -f "$KEYFILE"' EXIT
+}
+
+purge_stale_txt() {          # $1 = domain (may be *.foo)
+  # Removes leftover TXT records under the CNAME target before lego starts
+  # validating.
+  #
+  # Where they come from: lego issues "update add", not "replace". When a
+  # previous run was interrupted (Ctrl-C while waiting for propagation, a
+  # timeout, a crashed process), the cleanup never ran and the old token stays
+  # in the zone. The new one is added next to it, and resolvers that already
+  # cached the old RRset keep serving it for its full TTL -- so Let's Encrypt
+  # sees a set without its own token ("No TXT record found").
+  local d="${1#\*.}" chall target existing
+  chall="_acme-challenge.${d}"
+  target=$(dig +short +time=3 +tries=2 "@$RESOLVER1" CNAME "$chall" 2>/dev/null | head -1)
+  [[ -n $target ]] || return 0
+
+  existing=$(dig +short "@$DNS_SERVER" -p "$DNS_PORT" TXT "$target" 2>/dev/null || true)
+  [[ -n $existing ]] || return 0
+
+  tsig_keyfile
+  if nsupdate -k "$KEYFILE" <<EOF >/dev/null 2>&1
+server $DNS_SERVER $DNS_PORT
+update delete ${target} TXT
+send
+EOF
+  then
+    log "$chall: removed $(printf '%s\n' "$existing" | grep -c .) stale TXT record(s) left by an interrupted run"
+  else
+    log "warning: could not remove the stale TXT records under $target"
+  fi
+}
+
+days_left() {                # $1 = path to .crt ; prints the number of days (may be negative)
+  local crt="$1" end now
+  if [[ ! -s $crt ]]; then echo -1; return 0; fi
+  end=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-) || { echo -1; return 0; }
+  end=$(date -u -d "$end" +%s 2>/dev/null) || { echo -1; return 0; }
+  now=$(date -u +%s)
+  echo $(( (end - now) / 86400 ))
+}
+
+publish() {                  # $1=hostid  $2=stem  $3=domains (for meta)
+  local hostid="$1" stem="$2" domains="$3"
+  local src="$LEGO_DIR/certificates"
+  local dst="$PULL_DIR/$hostid" tmp a b fp notafter serial
+
+  if [[ ! -s $src/$stem.crt || ! -s $src/$stem.key ]]; then
+    fail "$hostid: $src/$stem.{crt,key} is missing"; return 1
+  fi
+
+  tmp=$(mktemp -d "$PULL_DIR/.$hostid.XXXXXX")
+
+  # lego writes the full chain (leaf + issuer) into .crt
+  cp "$src/$stem.crt" "$tmp/fullchain.pem"
+  cp "$src/$stem.key" "$tmp/privkey.pem"
+  if [[ -s $src/$stem.issuer.crt ]]; then
+    cp "$src/$stem.issuer.crt" "$tmp/chain.pem"
+  else
+    : > "$tmp/chain.pem"
+  fi
+  openssl x509 -in "$tmp/fullchain.pem" -out "$tmp/cert.pem"
+
+  # sanity check: the private key matches the certificate
+  a=$(openssl x509 -in "$tmp/cert.pem" -noout -pubkey | openssl sha256)
+  b=$(openssl pkey -in "$tmp/privkey.pem" -pubout | openssl sha256)
+  if [[ $a != "$b" ]]; then
+    rm -rf "$tmp"; fail "$hostid: the key does not match the certificate"; return 1
+  fi
+
+  fp=$(openssl x509 -in "$tmp/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+  notafter=$(openssl x509 -in "$tmp/cert.pem" -noout -enddate | cut -d= -f2-)
+  serial=$(openssl x509 -in "$tmp/cert.pem" -noout -serial | cut -d= -f2)
+
+  printf '{"hostid":"%s","domains":"%s","serial":"%s","not_after":"%s","fingerprint_sha256":"%s","published":"%s"}\n' \
+    "$hostid" "$domains" "$serial" "$notafter" "$fp" "$(date -u +%FT%TZ)" > "$tmp/meta.json"
+
+  ( cd "$tmp" && sha256sum cert.pem chain.pem fullchain.pem privkey.pem meta.json > SHA256SUMS )
+
+  chmod 0640 "$tmp"/*
+  chmod 0644 "$tmp/meta.json" "$tmp/SHA256SUMS"
+  chmod 0750 "$tmp"
+  if id -u certpull >/dev/null 2>&1; then chown -R root:certpull "$tmp"; fi
+
+  # atomic directory swap
+  rm -rf "$dst.old"
+  if [[ -d $dst ]]; then mv "$dst" "$dst.old"; fi
+  mv "$tmp" "$dst"
+  rm -rf "$dst.old"
+  log "$hostid: published (valid until $notafter, fp $fp)"
+}
+
+process_host() {
+  local conf="$1" hostid domains key_type threshold stem crt left cur new
+  hostid=$(basename "$conf" .conf)
+  if [[ ! $hostid =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+    fail "host name not allowed: $hostid"; return 1
+  fi
+
+  # reset before sourcing, so one host's file does not leak into the next iteration
+  DOMAINS=""; KEY_TYPE=""; RENEW_DAYS=""; ENABLED="yes"; ACME_ZONE=""
+  # shellcheck source=/dev/null
+  source "$conf"
+  # ACME_ZONE from a host file only affects CNAME generation (certpull-host);
+  # here we restore the global one so an empty value does not leak onwards.
+  ACME_ZONE="${ACME_ZONE:-$GLOBAL_ACME_ZONE}"
+
+  if [[ ${ENABLED,,} != yes ]]; then log "$hostid: disabled, skipping"; return 0; fi
+  if [[ -z $DOMAINS ]]; then fail "$hostid: empty DOMAINS list"; return 1; fi
+
+  domains="${DOMAINS// /, }"
+  key_type="${KEY_TYPE:-$GLOBAL_KEY_TYPE}"
+  threshold="${RENEW_DAYS:-$GLOBAL_RENEW_DAYS}"
+
+  local -a dargs=() d
+  for d in $DOMAINS; do dargs+=( --domains "$d" ); done
+
+  stem=$(lego_file_stem "${DOMAINS%% *}")
+  crt="$LEGO_DIR/certificates/$stem.crt"
+  left=$(days_left "$crt")
+
+  local -a base=(
+    lego
+    --accept-tos
+    --email "$ACME_EMAIL"
+    --server "$ACME_SERVER"
+    --path "$LEGO_DIR"
+    --key-type "$key_type"
+    --dns rfc2136
+    --dns.resolvers "$DNS_RESOLVERS"
+    "${dargs[@]}"
+  )
+  # By default lego checks propagation by asking the AUTHORITATIVE server
+  # directly -- that is our own Knot, which will always answer "it is there".
+  # Let's Encrypt resolves the name RECURSIVELY, so such a green result proves
+  # nothing. --dns.propagation-rns moves the check onto recursive resolvers,
+  # which stops lego from going to Let's Encrypt when the public path is broken.
+  if [[ ${PROPAGATION_RNS:-yes} == yes ]]; then base+=( --dns.propagation-rns ); fi
+  if (( PROPAGATION_WAIT > 0 )); then base+=( --dns.propagation-wait "${PROPAGATION_WAIT}s" ); fi
+
+  # Will we be calling lego at all?
+  local need=0
+  if [[ ! -s $crt ]] || (( FORCE )) || (( left <= threshold )); then need=1; fi
+
+  if (( (need || PREONLY) && ! SKIP_PRE )); then
+    local pre_ok=1
+    check_zone_transaction "$ACME_ZONE" || pre_ok=0
+    for d in $DOMAINS; do
+      preflight_domain "$d" || pre_ok=0
+    done
+    if (( ! pre_ok )); then
+      fail "$hostid: DNS preflight failed -- not calling lego (saving Let's Encrypt rate limits)"
+      notify "$hostid" "DNS preflight failed"
+      return 1
+    fi
+    if (( PREONLY )); then log "$hostid: preflight OK (${DOMAINS})"; return 0; fi
+  elif (( PREONLY )); then
+    log "$hostid: preflight skipped"
+    return 0
+  fi
+
+  # Clean zone before validating -- otherwise an old token from an interrupted
+  # run can mask the new one for the duration of its TTL.
+  if (( need )) && [[ ${PURGE_STALE_TXT:-yes} == yes ]]; then
+    for d in $DOMAINS; do purge_stale_txt "$d"; done
+  fi
+
+  if [[ ! -s $crt ]]; then
+    log "$hostid: no certificate yet -> issuing ($domains, $key_type)"
+    if (( DRY )); then log "DRY: ${base[*]} run"; return 0; fi
+    if ! "${base[@]}" run; then
+      fail "$hostid: lego run failed"; notify "$hostid" "lego run failed"; return 1
+    fi
+  elif (( FORCE )); then
+    log "$hostid: --force -> renewing (${left}d left)"
+    if (( DRY )); then log "DRY: ${base[*]} renew --days 10000"; return 0; fi
+    if ! "${base[@]}" renew --days 10000 --no-random-sleep; then
+      fail "$hostid: forced renewal failed"; notify "$hostid" "forced renew failed"; return 1
+    fi
+  elif (( left <= threshold )); then
+    log "$hostid: ${left}d left (threshold ${threshold}d) -> renewing"
+    if (( DRY )); then log "DRY: ${base[*]} renew --days $threshold"; return 0; fi
+    if ! "${base[@]}" renew --days "$threshold" --no-random-sleep; then
+      fail "$hostid: renewal failed"; notify "$hostid" "renew failed, ${left}d left"; return 1
+    fi
+  else
+    log "$hostid: OK, ${left}d left"
+  fi
+
+  if (( DRY )); then return 0; fi
+
+  # publish when the fingerprint in pull differs from the one in lego's store
+  new=$(openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+  cur=$(sed -n 's/.*"fingerprint_sha256":"\([^"]*\)".*/\1/p' "$PULL_DIR/$hostid/meta.json" 2>/dev/null || true)
+  if [[ -z $cur || $cur != "$new" ]]; then
+    # NOTE: process_host is called as `process_host ... || rc=1`, which
+    # DISABLES set -e for the whole function body. A failure in `publish` will
+    # therefore not abort anything by itself -- it has to be caught explicitly,
+    # or the `return 0` below would report success for a certificate that never
+    # reached the pull directory.
+    if ! publish "$hostid" "$stem" "$domains"; then
+      fail "$hostid: the certificate exists, but publishing to $PULL_DIR failed"
+      notify "$hostid" "publish failed"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# --- main -------------------------------------------------------------------
+rc=0
+shopt -s nullglob
+declare -a files
+if [[ -n $ONLY ]]; then
+  files=( "$HOSTS_DIR/$ONLY.conf" )
+  [[ -r ${files[0]:-} ]] || { echo "$HOSTS_DIR/$ONLY.conf does not exist" >&2; exit 1; }
+else
+  files=( "$HOSTS_DIR"/*.conf )
+fi
+
+if (( ${#files[@]} == 0 )); then
+  log "WARNING: $HOSTS_DIR contains no files at all -- there is nothing to renew"
+  log "         add a host:  certpull-host add <hostid> <domain>"
+  exit 1
+fi
+
+# A failure on one host does NOT abort the run -- every host is independent and
+# one broken CNAME must not block the renewal of all the others.
+ok_n=0; fail_n=0; failed=()
+for f in "${files[@]}"; do
+  if process_host "$f"; then
+    (( ++ok_n ))
+  else
+    rc=1; (( ++fail_n )); failed+=( "$(basename "$f" .conf)" )
+  fi
+done
+
+if (( fail_n )); then
+  log "summary: ${ok_n} OK, ${fail_n} failed -> ${failed[*]}"
+else
+  log "summary: ${ok_n} OK, no failures"
+fi
+
+exit "$rc"

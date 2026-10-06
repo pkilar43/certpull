@@ -1,0 +1,11 @@
+[Unit]
+Description=certpull - check and renew certificates twice a day
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=certpull-renew.service
+
+[Install]
+WantedBy=timers.target

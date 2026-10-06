@@ -1,0 +1,47 @@
+# /etc/knot/knot.conf -- Knot DNS as the authoritative server for the acme zone.
+#
+# This server hosts ONLY the delegated zone (acme.example.com).
+# No production domains live here -- if this server dies, production traffic
+# keeps working and the only thing that stops is certificate renewal.
+
+server:
+    rundir: "/run/knot"
+    user: knot:knot
+    listen: [ 0.0.0.0@53, ::@53 ]
+    # authoritative only; we never answer recursive queries
+    udp-max-payload: 1232
+
+log:
+  - target: syslog
+    any: info
+
+# Guard against being used as an amplifier (the zone is tiny, but still)
+mod-rrl:
+  - id: default
+    rate-limit: 200
+    slip: 2
+
+key:
+  - id: certpull.
+    algorithm: hmac-sha256
+    secret: REPLACE_ME_WITH_KEYMGR_OUTPUT
+
+acl:
+  - id: acl_certpull_update
+    key: certpull.
+    address: [ 127.0.0.1, ::1 ]
+    action: update
+
+template:
+  - id: default
+    storage: "/var/lib/knot"
+    file: "%s.zone"
+    # the zone is driven exclusively by dynamic updates:
+    zonefile-load: difference-no-serial
+    journal-content: all
+    zonefile-sync: -1
+    global-module: mod-rrl/default
+
+zone:
+  - domain: acme.example.com
+    acl: acl_certpull_update

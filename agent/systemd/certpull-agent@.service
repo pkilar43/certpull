@@ -1,0 +1,36 @@
+[Unit]
+Description=certpull agent running as user %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+ExecStart=/usr/local/bin/certpull-agent
+Nice=10
+TimeoutStartSec=300
+
+# systemd sets HOME/USER/LOGNAME from /etc/passwd when User= is given, and the
+# agent has a getent fallback anyway -- which is why no path is hardcoded here
+# and the unit works regardless of where the user's home directory lives.
+
+# ProtectSystem=full: /usr, /boot and /etc become read-only while the user's
+# home directory stays writable -- that is where the certificates land.
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# NOTE: NoNewPrivileges is deliberately NOT enabled. When RELOAD_CMD uses
+# `sudo -n systemctl reload ...`, sudo needs setuid and would fail under
+# NoNewPrivileges=yes. If your RELOAD_CMD is empty or does not use sudo, add
+# a drop-in:
+#   systemctl edit certpull-agent@certpull
+#   [Service]
+#   NoNewPrivileges=yes

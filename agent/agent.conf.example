@@ -1,0 +1,44 @@
+# /etc/certpull/agent.conf -- agent configuration on a LAN machine
+# shellcheck shell=bash
+
+# Account and host of the certpull server.
+SERVER="certpull@ns-certpull.example.com"
+SERVER_PORT="22"
+
+# Host identifier -- must match the file name in /etc/certpull/hosts.d on the
+# server and the forced command in authorized_keys.
+HOSTID="srv-web-01"
+
+# The agent's SSH key (no passphrase; readable by root only).
+SSH_KEY="/etc/certpull/id_ed25519"
+KNOWN_HOSTS="/etc/certpull/known_hosts"
+
+# Where to install the certificate.
+DEST="/etc/ssl/certpull"
+
+# File names in the destination directory:
+#   pem     cert.pem  chain.pem  fullchain.pem  privkey.pem   (default)
+#   crtkey  <hostid>.crt (full chain) + <hostid>.key
+#           + <hostid>.chain.crt + <hostid>.leaf.crt
+FILE_STYLE="pem"
+
+# File ownership and permissions.
+CERT_OWNER="root:root"
+CERT_MODE="0644"
+KEY_OWNER="root:root"
+KEY_MODE="0600"
+
+# Also write fullchain+key into a single file (HAProxy, Postfix, Dovecot).
+COMBINED="no"
+
+# Verification: the agent rejects a certificate that does not cover these
+# names. Empty = check only what came in meta.json from the server.
+EXPECT_DOMAINS=""
+
+# Command to reload the service after the certificate is replaced.
+# Several commands may be chained with ';'. If it returns an error, the agent
+# rolls the replacement back.
+RELOAD_CMD="apache2ctl configtest && systemctl reload apache2"
+
+# Called after a failed cycle: $1=hostid $2=message  (optional)
+# NOTIFY_CMD="/usr/local/lib/certpull/notify-mail"

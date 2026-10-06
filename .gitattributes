@@ -1,0 +1,11 @@
+# The scripts are deployed to Debian -- never convert them to CRLF, or the
+# shebang stops working.
+* text=auto eol=lf
+*.sh          text eol=lf
+certpull-*    text eol=lf
+*.example     text eol=lf
+*.conf        text eol=lf
+*.service     text eol=lf
+*.timer       text eol=lf
+*.md          text eol=lf
+*.tar.gz      binary

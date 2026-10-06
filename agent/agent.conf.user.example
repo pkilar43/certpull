@@ -1,0 +1,46 @@
+# ~/.config/certpull/agent.conf
+# Dedicated-user mode. The agent detects it from UID != 0 and then assumes:
+#
+#   SSH key      ~/.ssh/id_ed25519
+#   known_hosts  ~/.ssh/known_hosts
+#   destination  ~/certificates          (mode 0700)
+#   lock         $XDG_RUNTIME_DIR or ~/.cache/certpull
+#
+# Only what is genuinely host-specific needs to be set below. The rest are
+# comments showing what can be overridden.
+# shellcheck shell=bash
+
+SERVER="certpull@ns-certpull.example.com"
+SERVER_PORT="22"
+HOSTID="srv-web-01"
+
+# File names in the destination directory:
+#   pem     cert.pem  chain.pem  fullchain.pem  privkey.pem   (default)
+#   crtkey  <hostid>.crt (full chain) + <hostid>.key
+#           + <hostid>.chain.crt + <hostid>.leaf.crt
+FILE_STYLE="crtkey"
+
+# The default paths are derived from $HOME -- uncomment only to change them.
+# SSH_KEY="$HOME/.ssh/id_ed25519"
+# KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+# DEST="$HOME/certificates"
+# DEST_MODE="0700"
+
+CERT_MODE="0644"
+KEY_MODE="0600"
+
+# Also write fullchain+key into a single file (HAProxy, Postfix, Dovecot).
+COMBINED="no"
+
+# The agent rejects a certificate that does not cover these names.
+# Empty = check only what came in meta.json from the server.
+EXPECT_DOMAINS=""
+
+# Service reload. Without root this needs passwordless sudo restricted to a
+# single command -- the installer writes such a rule into /etc/sudoers.d/ when
+# you pass --reload-unit. If the agent only drops the files off and something
+# else reloads the service (a path unit, your own script), leave this empty.
+RELOAD_CMD=""
+# RELOAD_CMD="sudo -n /usr/bin/systemctl reload nginx"
+
+# NOTIFY_CMD="$HOME/bin/certpull-notify"

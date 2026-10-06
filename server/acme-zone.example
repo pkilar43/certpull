@@ -1,0 +1,23 @@
+; /var/lib/knot/acme.example.com.zone
+; Initial zone file. After the first load Knot keeps changes in its journal
+; and this file is no longer rewritten (zonefile-sync: -1).
+;
+; REPLACE:
+;   acme.example.com        -> your delegated zone
+;   ns-certpull.example.com -> the NS name pointing at this server
+;   pki@example.com         -> contact address (@ becomes .)
+
+$ORIGIN acme.example.com.
+$TTL 300
+
+@   IN  SOA ns-certpull.example.com. pki.example.com. (
+            2026010101  ; serial
+            3600        ; refresh
+            600         ; retry
+            604800      ; expire
+            60 )        ; minimum = negative TTL (short, so a cached NXDOMAIN hurts less)
+
+@   IN  NS  ns-certpull.example.com.
+
+; Nothing else. The _acme-challenge TXT records appear here for a few dozen
+; seconds during validation and are removed again by lego.

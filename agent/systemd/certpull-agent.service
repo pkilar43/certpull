@@ -1,0 +1,21 @@
+[Unit]
+Description=certpull agent - fetch the certificate from the certpull server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/certpull/agent.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/certpull-agent
+Nice=10
+TimeoutStartSec=300
+
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native

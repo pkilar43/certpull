@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# certpull-pull-shell -- forced command for the "certpull" SSH account.
+#
+# In ~certpull/.ssh/authorized_keys every key is given the list of hostids it
+# is allowed to fetch -- one or many:
+#
+#   restrict,command="/usr/local/lib/certpull/certpull-pull-shell srv-web-01" ssh-ed25519 AAAA... certpull-srv-web-01
+#   restrict,command="/usr/local/lib/certpull/certpull-pull-shell srv-web-01 srv-web-01-mail wildcard-lan" ssh-ed25519 AAAA... certpull-srv-web-01
+#
+# The client sends:  "<verb> [hostid]"
+# If it omits the hostid, the first one on the list is used (backwards
+# compatibility). A requested hostid MUST be on the list from the forced
+# command -- a client cannot reach for somebody else's certificate.
+set -euo pipefail
+
+PULL_DIR="${CERTPULL_PULL_DIR:-/var/lib/certpull/pull}"
+
+deny() { echo "certpull: $*" >&2; exit 1; }
+
+(($#)) || deny "no hostid list in the forced command"
+
+ALLOWED=()
+for h in "$@"; do
+  [[ $h =~ ^[a-z0-9][a-z0-9._-]*$ ]] || deny "bad hostid in the forced command: $h"
+  ALLOWED+=( "$h" )
+done
+
+# The client controls only these two words; the rest of the line is ignored.
+read -r VERB REQ _ <<<"${SSH_ORIGINAL_COMMAND:-fetch}"
+VERB="${VERB:-fetch}"
+
+PEER="${SSH_CONNECTION:-}"; PEER="${PEER%% *}"
+
+if [[ $VERB == list ]]; then
+  logger -t certpull-pull -- "verb=list from=${PEER:-local}" 2>/dev/null || true
+  printf '%s\n' "${ALLOWED[@]}"
+  exit 0
+fi
+
+HOSTID="${REQ:-${ALLOWED[0]}}"
+[[ $HOSTID =~ ^[a-z0-9][a-z0-9._-]*$ ]] || deny "bad hostid: $HOSTID"
+
+ok=0
+for h in "${ALLOWED[@]}"; do if [[ $h == "$HOSTID" ]]; then ok=1; fi; done
+(( ok )) || deny "this key has no access to $HOSTID (allowed: ${ALLOWED[*]})"
+
+DIR="$PULL_DIR/$HOSTID"
+[[ -d $DIR ]] || deny "no published certificate for $HOSTID"
+
+logger -t certpull-pull -- "host=$HOSTID verb=$VERB from=${PEER:-local}" 2>/dev/null || true
+
+case "$VERB" in
+  ping)
+    echo "pong $HOSTID"
+    ;;
+  meta)
+    cat "$DIR/meta.json"
+    ;;
+  sums)
+    cat "$DIR/SHA256SUMS"
+    ;;
+  fetch)
+    # tar stream on stdout; the agent unpacks it into a temporary directory
+    tar -C "$DIR" -cf - \
+        --owner=0 --group=0 --mode=0600 \
+        cert.pem chain.pem fullchain.pem privkey.pem meta.json SHA256SUMS
+    ;;
+  *)
+    deny "command not allowed: $VERB (allowed: list ping meta sums fetch)"
+    ;;
+esac

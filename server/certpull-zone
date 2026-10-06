@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# certpull-zone -- add further delegated zones to a single installation.
+#
+#   certpull-zone add <zone> [ns-name]    add a zone to Knot + show delegation
+#   certpull-zone list                    zones served by this host
+#   certpull-zone show <zone>             delegation records to paste
+#   certpull-zone del <zone>              detach a zone (the zone file stays)
+#   certpull-zone soa-min <zone> [sec]    shorten the negative TTL (default 60s)
+#
+# Note: in most deployments ONE zone is enough for every domain -- the CNAME
+# target does not have to live in the same domain as the name being validated.
+# Further zones only make sense when you want each client's delegation to
+# originate from that client's own domain.
+set -euo pipefail
+
+CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
+KNOTCONF="${KNOTCONF:-/etc/knot/knot.conf}"
+KNOTDIR="${KNOTDIR:-/var/lib/knot}"
+
+# shellcheck source=/dev/null
+source "$CONF"
+: "${ACME_ZONE:?}" "${ACME_EMAIL:?}"
+NS_DEFAULT="${ACME_NS_NAME:-ns-certpull.${ACME_ZONE#*.}}"
+
+usage() { sed -n '3,9p' "$0"; exit 2; }
+die()   { echo "certpull-zone: $*" >&2; exit 1; }
+
+valid_zone() {
+  [[ $1 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || die "invalid zone name: $1"
+}
+
+zone_present() { grep -qE "^[[:space:]]*- domain:[[:space:]]+${1//./\\.}[[:space:]]*$" "$KNOTCONF"; }
+
+reload_knot() {
+  knotc conf-check || die "knot.conf fails validation -- reloading nothing"
+  knotc reload
+}
+
+show_delegation() {          # $1=zone $2=ns
+  local zone="$1" ns="$2" ip4 ip6
+  ip4=$(hostname -I 2>/dev/null | awk '{print $1}')
+  ip6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | head -1)
+  cat <<EOF
+
+Paste this at the DNS operator of the parent domain of ${zone}:
+
+  ${zone}.   3600  IN  NS  ${ns}.
+
+The A/AAAA record for ${ns} is needed exactly ONCE, in whichever domain that
+name lives in:
+
+  ${ns}.   3600  IN  A     ${ip4:-<server IP>}
+$( [[ -n ${ip6:-} ]] && printf '  %s.   3600  IN  AAAA  %s\n' "$ns" "$ip6" )
+
+Verify with:
+  dig +trace SOA ${zone}
+  dig @${ip4:-<IP>} SOA ${zone}
+EOF
+}
+
+cmd="${1:-}"; shift || usage
+
+case "$cmd" in
+
+add)
+  zone="${1:-}"; [[ -n $zone ]] || usage
+  valid_zone "$zone"
+  ns="${2:-$NS_DEFAULT}"
+
+  if zone_present "$zone"; then die "zone $zone is already in $KNOTCONF"; fi
+
+  zf="$KNOTDIR/${zone}.zone"
+  if [[ ! -s $zf ]]; then
+    cat > "$zf" <<EOF
+\$ORIGIN ${zone}.
+\$TTL 300
+
+@   IN  SOA ${ns}. ${ACME_EMAIL/@/.}. (
+            1           ; serial
+            3600        ; refresh
+            600         ; retry
+            604800      ; expire
+            60 )        ; minimum (negative TTL)
+
+@   IN  NS  ${ns}.
+EOF
+    chown knot:knot "$zf" 2>/dev/null || true
+    chmod 0640 "$zf" 2>/dev/null || true
+    echo "created $zf"
+  fi
+
+  cp -a "$KNOTCONF" "$KNOTCONF.bak.$(date +%Y%m%d%H%M%S)"
+  printf '\n  - domain: %s\n    acl: acl_certpull_update\n' "$zone" >> "$KNOTCONF"
+  reload_knot
+  echo "added zone $zone"
+  show_delegation "$zone" "$ns"
+  echo
+  echo "To make a host use this zone:  certpull-host add --zone $zone <hostid> <domains...>"
+  ;;
+
+list)
+  grep -E "^[[:space:]]*- domain:" "$KNOTCONF" | awk '{print $3}' | while read -r z; do
+    st=$(knotc zone-status "$z" 2>/dev/null | head -1 || echo "(not loaded at runtime)")
+    printf '%-32s %s\n' "$z" "$st"
+  done
+  ;;
+
+soa-min)
+  # Shortens the negative TTL (the SOA minimum field) of a live zone.
+  #
+  # Why: every query for a name that does not exist in the zone -- which is
+  # exactly what _acme-challenge looks like between validations -- is cached by
+  # resolvers for as many seconds as minimum says. At 300 a failed attempt (or
+  # the cleanup after certpull-verify) blocks the next one for five minutes,
+  # i.e. longer than lego's three-minute propagation timeout. 60s is safe.
+  zone="${1:-}"; [[ -n $zone ]] || usage
+  valid_zone "$zone"
+  zone_present "$zone" || die "zone $zone is not served by this host"
+  newmin="${2:-60}"
+  [[ $newmin =~ ^[0-9]+$ ]] || die "minimum must be a number of seconds"
+
+  cur=$(knotc zone-read "$zone" @ SOA 2>/dev/null | tail -1) \
+    || die "cannot read the SOA of zone $zone"
+
+  # MIND THE FORMAT: knotc prefixes every line with a [zone.] marker, so
+  # counting fields from the start goes off by one. We anchor on the word SOA:
+  #   ... SOA <mname> <rname> <serial> <refresh> <retry> <expire> <minimum>
+  # and the TTL is the field right before it.
+  ttl=$(awk '{for(i=1;i<=NF;i++) if($i=="SOA"){print $(i-1); exit}}' <<<"$cur")
+  read -r mname rname serial refresh retry expire oldmin <<<"$(
+    awk '{for(i=1;i<=NF;i++) if($i=="SOA"){for(j=i+1;j<=NF;j++) printf "%s ",$j; exit}}' <<<"$cur"
+  )"
+
+  for v in ttl serial refresh retry expire oldmin; do
+    [[ ${!v} =~ ^[0-9]+$ ]] || die "cannot parse the SOA from knotc ($v='${!v}'), whole line: $cur"
+  done
+  [[ -n $mname && -n $rname ]] || die "cannot parse the SOA from knotc: $cur"
+
+  if [[ $oldmin == "$newmin" ]]; then
+    echo "$zone: minimum is already ${newmin}s -- nothing to change"
+    exit 0
+  fi
+
+  newserial=$((serial + 1))
+  knotc zone-begin "$zone" >/dev/null
+  # from here on every exit path must close the transaction, otherwise the zone
+  # stays in the "open change" state and the next zone-begin will fail
+  trap 'knotc zone-abort "$zone" >/dev/null 2>&1 || true' EXIT
+
+  if knotc zone-set "$zone" @ "$ttl" SOA \
+       "$mname" "$rname" "$newserial" "$refresh" "$retry" "$expire" "$newmin" >/dev/null
+  then
+    knotc zone-commit "$zone" >/dev/null
+    trap - EXIT
+    echo "$zone: minimum ${oldmin}s -> ${newmin}s (serial $serial -> $newserial)"
+  else
+    die "changing the SOA failed -- transaction rolled back"
+  fi
+  ;;
+
+show)
+  zone="${1:-}"; [[ -n $zone ]] || usage
+  valid_zone "$zone"
+  zone_present "$zone" || die "zone $zone is not served by this host"
+  ns=$(awk -v z="$zone." '$0 ~ "IN[ \t]+NS" {print $NF; exit}' "$KNOTDIR/${zone}.zone" 2>/dev/null || true)
+  show_delegation "$zone" "${ns%.}"
+  ;;
+
+del)
+  zone="${1:-}"; [[ -n $zone ]] || usage
+  valid_zone "$zone"
+  zone_present "$zone" || die "zone $zone is not in $KNOTCONF"
+  if [[ $zone == "$ACME_ZONE" ]]; then
+    die "this is the default zone from certpull.conf -- change ACME_ZONE there first"
+  fi
+
+  cp -a "$KNOTCONF" "$KNOTCONF.bak.$(date +%Y%m%d%H%M%S)"
+  tmp=$(mktemp)
+  awk -v z="$zone" '
+    $0 ~ "^[[:space:]]*- domain:[[:space:]]+" z "[[:space:]]*$" { skip=1; next }
+    skip && $0 ~ "^[[:space:]]*acl:" { skip=0; next }
+    { skip=0; print }
+  ' "$KNOTCONF" > "$tmp"
+  cat "$tmp" > "$KNOTCONF"; rm -f "$tmp"
+  reload_knot
+  echo "detached $zone (the file $KNOTDIR/${zone}.zone stays on disk)"
+  ;;
+
+*) usage ;;
+esac

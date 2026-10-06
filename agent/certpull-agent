@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# certpull-agent -- fetches the certificate from the certpull server over SSH
+# and installs it locally. Run from a timer on a LAN machine. Traffic only ever
+# goes LAN -> internet, so the host does not need to be reachable from outside.
+#
+#   certpull-agent                -> fetch if the fingerprint changed
+#   certpull-agent --force        -> fetch and reinstall unconditionally
+#   certpull-agent --check        -> only show the state, change nothing
+#   certpull-agent --remote-list  -> ask the server what this key may fetch
+#
+# It works in two modes, detected from the UID:
+#
+#   root                   config /etc/certpull/agent.conf (or agent.d/*.conf)
+#                          key    /etc/certpull/id_ed25519
+#                          target /etc/ssl/certpull
+#
+#   dedicated user         config ~/.config/certpull/agent.conf (or agent.d/*.conf)
+#                          key    ~/.ssh/id_ed25519
+#                          target ~/certificates
+#
+# Every one of those values can be overridden in the configuration file.
+set -Eeuo pipefail
+
+# --- who is running us ------------------------------------------------------
+AM_ROOT=0; [[ $EUID -eq 0 ]] && AM_ROOT=1 || true
+MYUSER="$(id -un)"
+MYHOME="${HOME:-$(getent passwd "$MYUSER" | cut -d: -f6)}"
+[[ -n $MYHOME ]] || { echo "cannot determine the home directory of $MYUSER" >&2; exit 1; }
+
+if (( AM_ROOT )); then
+  CONF_DIR="/etc/certpull"
+else
+  CONF_DIR="${XDG_CONFIG_HOME:-$MYHOME/.config}/certpull"
+fi
+
+CONF="${CERTPULL_AGENT_CONF:-}"
+
+# --- multi-profile mode -----------------------------------------------------
+if [[ -z $CONF ]]; then
+  shopt -s nullglob
+  profiles=( "$CONF_DIR"/agent.d/*.conf )
+  if ((${#profiles[@]})); then
+    rc=0
+    for p in "${profiles[@]}"; do
+      CERTPULL_AGENT_CONF="$p" "$0" "$@" || rc=1
+    done
+    exit "$rc"
+  fi
+  CONF="$CONF_DIR/agent.conf"
+fi
+
+[[ -r $CONF ]] || { echo "$CONF is missing" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$CONF"
+
+: "${SERVER:?}" "${HOSTID:?}"
+: "${SERVER_PORT:=22}"
+
+# --- defaults that depend on the mode ---------------------------------------
+if (( AM_ROOT )); then
+  : "${SSH_KEY:=/etc/certpull/id_ed25519}"
+  : "${KNOWN_HOSTS:=/etc/certpull/known_hosts}"
+  : "${DEST:=/etc/ssl/certpull}"
+  : "${DEST_MODE:=0755}"
+  : "${CERT_OWNER:=root:root}" "${KEY_OWNER:=root:root}"
+  LOCK_DIR="/run/lock"
+else
+  : "${SSH_KEY:=$MYHOME/.ssh/id_ed25519}"
+  : "${KNOWN_HOSTS:=$MYHOME/.ssh/known_hosts}"
+  : "${DEST:=$MYHOME/certificates}"
+  : "${DEST_MODE:=0700}"
+  # without root we do not change ownership -- the files are ours anyway
+  CERT_OWNER=""; KEY_OWNER=""
+  LOCK_DIR="${XDG_RUNTIME_DIR:-$MYHOME/.cache/certpull}"
+fi
+: "${CERT_MODE:=0644}" "${KEY_MODE:=0600}"
+: "${COMBINED:=no}" "${EXPECT_DOMAINS:=}" "${RELOAD_CMD:=}"
+# pem    -> cert.pem chain.pem fullchain.pem privkey.pem   (default)
+# crtkey -> <hostid>.crt (full chain) + <hostid>.key + <hostid>.chain.crt
+: "${FILE_STYLE:=pem}"
+
+LOCK="$LOCK_DIR/certpull-agent.$(basename "$CONF" .conf).lock"
+
+FORCE=0; CHECK=0; RLIST=0
+for a in "$@"; do
+  case "$a" in
+    --force) FORCE=1 ;;
+    --check) CHECK=1 ;;
+    --remote-list) RLIST=1 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+log()  { printf '%s\n' "$*" >&2; logger -t certpull-agent -- "$*" 2>/dev/null || true; }
+die()  {
+  log "ERROR: $*"
+  if [[ -n ${NOTIFY_CMD:-} ]]; then "$NOTIFY_CMD" "$HOSTID" "$*" || true; fi
+  exit 1
+}
+
+# --- file names in the destination directory --------------------------------
+if [[ ${FILE_STYLE,,} == crtkey ]]; then
+  OUT_CERT="$HOSTID.leaf.crt"     # the leaf alone, rarely needed
+  OUT_FULL="$HOSTID.crt"          # the one you point the service config at
+  OUT_CHAIN="$HOSTID.chain.crt"
+  OUT_KEY="$HOSTID.key"
+  OUT_COMB="$HOSTID.pem"
+else
+  OUT_CERT="cert.pem"; OUT_FULL="fullchain.pem"; OUT_CHAIN="chain.pem"
+  OUT_KEY="privkey.pem"; OUT_COMB="combined.pem"
+fi
+
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+exec 9>"$LOCK"
+flock -n 9 || { log "another instance is already running"; exit 0; }
+
+SSH=( ssh
+      -p "$SERVER_PORT"
+      -i "$SSH_KEY"
+      -o IdentitiesOnly=yes
+      -o UserKnownHostsFile="$KNOWN_HOSTS"
+      -o StrictHostKeyChecking=yes
+      -o BatchMode=yes
+      -o ConnectTimeout=15
+      -o ServerAliveInterval=10
+      -o ServerAliveCountMax=3
+      "$SERVER" )
+
+json() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
+if (( RLIST )); then
+  echo "hostids available to this key:"
+  "${SSH[@]}" list || die "the server does not support 'list' (an old pull-shell?)"
+  exit 0
+fi
+
+[[ -r $SSH_KEY ]] || die "cannot read the key $SSH_KEY (running as $MYUSER)"
+
+# --- 1. remote fingerprint --------------------------------------------------
+META=$("${SSH[@]}" "meta $HOSTID" 2>/dev/null) \
+  || die "cannot fetch meta for $HOSTID from $SERVER (key? known_hosts? permission for this hostid?)"
+REMOTE_FP=$(printf '%s' "$META" | json fingerprint_sha256)
+REMOTE_NA=$(printf '%s' "$META" | json not_after)
+REMOTE_DOMAINS=$(printf '%s' "$META" | json domains)
+[[ -n $REMOTE_FP ]] || die "meta.json without fingerprint_sha256"
+
+# --- 2. local fingerprint ---------------------------------------------------
+LOCAL_FP=""
+if [[ -s $DEST/$OUT_FULL ]]; then
+  LOCAL_FP=$(openssl x509 -in "$DEST/$OUT_FULL" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+fi
+
+if (( CHECK )); then
+  echo "profile:   $(basename "$CONF")"
+  echo "user:      $MYUSER"
+  echo "host:      $HOSTID"
+  echo "domains:   $REMOTE_DOMAINS"
+  echo "expires:   $REMOTE_NA"
+  echo "directory: $DEST  (style: $FILE_STYLE -> $OUT_FULL + $OUT_KEY)"
+  echo "remote fp: $REMOTE_FP"
+  echo "local fp:  ${LOCAL_FP:-(none)}"
+  if [[ $LOCAL_FP == "$REMOTE_FP" ]]; then echo "state:     up to date"; else echo "state:     NEEDS UPDATE"; fi
+  exit 0
+fi
+
+if [[ $LOCAL_FP == "$REMOTE_FP" ]] && (( ! FORCE )); then
+  log "$HOSTID: up to date (valid until $REMOTE_NA)"
+  exit 0
+fi
+
+# --- 3. download ------------------------------------------------------------
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/certpull.XXXXXX")
+chmod 0700 "$TMP"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+log "$HOSTID: fetching a new certificate ($REMOTE_FP)"
+"${SSH[@]}" "fetch $HOSTID" > "$TMP/bundle.tar" || die "the download failed"
+tar -C "$TMP" -xf "$TMP/bundle.tar" || die "corrupt archive"
+rm -f "$TMP/bundle.tar"
+
+# --- 4. verification (nothing lands in the destination before this step) -----
+( cd "$TMP" && sha256sum -c --status SHA256SUMS ) || die "checksums do not match"
+
+for f in cert.pem fullchain.pem privkey.pem; do
+  [[ -s $TMP/$f ]] || die "$f is missing or empty"
+done
+
+GOT_FP=$(openssl x509 -in "$TMP/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+[[ $GOT_FP == "$REMOTE_FP" ]] || die "the fingerprint of the downloaded cert does not match meta.json"
+
+A=$(openssl x509 -in "$TMP/cert.pem" -noout -pubkey | openssl sha256)
+B=$(openssl pkey -in "$TMP/privkey.pem" -pubout | openssl sha256)
+[[ $A == "$B" ]] || die "the private key does not match the certificate"
+
+openssl x509 -in "$TMP/cert.pem" -noout -checkend 86400 >/dev/null \
+  || die "the certificate expires within 24h or has already expired -- not installing it"
+
+openssl verify -untrusted "$TMP/fullchain.pem" "$TMP/cert.pem" >/dev/null 2>&1 \
+  || log "warning: openssl verify could not confirm the chain (LE staging? a private CA?)"
+
+CHECK_NAMES="${EXPECT_DOMAINS:-${REMOTE_DOMAINS//,/ }}"
+for n in $CHECK_NAMES; do
+  openssl x509 -in "$TMP/cert.pem" -noout -checkhost "${n#\*.}" >/dev/null 2>&1 \
+    || die "the certificate does not cover the name $n"
+done
+
+# --- 5. installation --------------------------------------------------------
+install -d -m "$DEST_MODE" "$DEST" 2>/dev/null || mkdir -p "$DEST"
+[[ -w $DEST ]] || die "no write permission for $DEST (running as $MYUSER)"
+
+BACKUP="$DEST/.previous"
+rm -rf "$BACKUP"
+if [[ -s $DEST/$OUT_FULL ]]; then
+  install -d -m 0700 "$BACKUP"
+  for f in "$OUT_CERT" "$OUT_FULL" "$OUT_CHAIN" "$OUT_KEY" "$OUT_COMB"; do
+    [[ -e $DEST/$f ]] && cp -a "$DEST/$f" "$BACKUP/" || true
+  done
+fi
+
+if [[ ${COMBINED,,} == yes ]]; then
+  cat "$TMP/fullchain.pem" "$TMP/privkey.pem" > "$TMP/combined.pem"
+fi
+
+put() {                      # $1=source file in TMP  $2=target name  $3=owner  $4=mode
+  local src="$TMP/$1" dst="$DEST/$2" owner="$3" mode="$4"
+  [[ -s $src ]] || return 0
+  local -a args=( -m "$mode" )
+  if [[ -n $owner ]]; then args+=( -o "${owner%%:*}" -g "${owner##*:}" ); fi
+  install "${args[@]}" "$src" "$DEST/.new.$2"
+  mv -f "$DEST/.new.$2" "$dst"
+}
+
+put cert.pem      "$OUT_CERT"  "$CERT_OWNER" "$CERT_MODE"
+put fullchain.pem "$OUT_FULL"  "$CERT_OWNER" "$CERT_MODE"
+put chain.pem     "$OUT_CHAIN" "$CERT_OWNER" "$CERT_MODE"
+put privkey.pem   "$OUT_KEY"   "$KEY_OWNER"  "$KEY_MODE"
+put combined.pem  "$OUT_COMB"  "$KEY_OWNER"  "$KEY_MODE"
+put meta.json     "meta.json"  "$CERT_OWNER" "0644"
+
+# --- 6. service reload ------------------------------------------------------
+# With a dedicated user, RELOAD_CMD usually needs passwordless sudo, e.g.
+#   RELOAD_CMD="sudo -n /usr/bin/systemctl reload nginx"
+# with a rule in /etc/sudoers.d/certpull-agent restricted to that one command.
+if [[ -n $RELOAD_CMD ]]; then
+  if bash -c "$RELOAD_CMD"; then
+    log "$HOSTID: installed into $DEST and reloaded (valid until $REMOTE_NA)"
+  else
+    log "the reload failed -- rolling back to the previous certificate"
+    if [[ -d $BACKUP ]]; then
+      cp -a "$BACKUP"/. "$DEST"/ 2>/dev/null || true
+      bash -c "$RELOAD_CMD" || log "the rollback did not reload the service either -- NEEDS ATTENTION"
+    fi
+    die "RELOAD_CMD returned an error"
+  fi
+else
+  log "$HOSTID: installed into $DEST (valid until $REMOTE_NA), no RELOAD_CMD"
+fi
+
+exit 0

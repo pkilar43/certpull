@@ -1,0 +1,79 @@
+# ===========================================================================
+# certpull -- .gitignore
+#
+# Everything below can appear inside the repository directory if somebody runs
+# install-server.sh, install-agent.sh or --update from a CLONE on the certpull
+# server or on a LAN host. This repository is public, so we block all of it up
+# front rather than relying on nobody ever running `git add -A` in the wrong
+# place.
+# ===========================================================================
+
+# --- TSIG key: full control over the DNS zone -------------------------------
+tsig.env
+tsig*.key
+*.tsig
+
+# --- private keys, certificates, CSRs ---------------------------------------
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.jks
+
+# --- SSH keys and host trust ------------------------------------------------
+id_ed25519*
+id_rsa*
+id_ecdsa*
+*.pub
+known_hosts*
+authorized_keys*
+
+# --- live configuration (the *.example templates stay in the repo) ----------
+certpull.conf
+agent.conf
+# MIND THE MATCHING RULES: a pattern containing "/" is anchored to the
+# directory holding .gitignore, so "hosts.d/*.conf" would NOT match
+# "server/hosts.d/foo.conf". Hence the "**/".
+**/hosts.d/*.conf
+!**/hosts.d/example.conf
+agent.d/
+
+# --- DNS zones, the journal and Knot's configuration ------------------------
+*.zone
+*.zone.jrnl
+*.db
+knot.conf
+
+# --- state of a running installation ----------------------------------------
+lego/
+accounts/
+certificates/
+pull/
+
+# --- backups made by the installers and by certpull-zone --------------------
+*.bak
+*.bak.*
+*.orig
+*.rej
+
+# --- archives and scratch files ---------------------------------------------
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+.sync*
+_to_delete/
+
+# --- editors and operating systems ------------------------------------------
+.env
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

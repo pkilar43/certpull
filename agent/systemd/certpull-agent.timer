@@ -1,0 +1,11 @@
+[Unit]
+Description=certpull agent - check hourly for a new certificate
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=30m
+Persistent=true
+Unit=certpull-agent.service
+
+[Install]
+WantedBy=timers.target

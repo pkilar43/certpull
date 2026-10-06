@@ -1,0 +1,26 @@
+[Unit]
+Description=certpull - renew certificates and publish them to the pull directory
+After=network-online.target knot.service
+Wants=network-online.target
+ConditionPathExists=/etc/certpull/certpull.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/certpull-issue
+Nice=10
+
+# hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/certpull /run/lock
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
