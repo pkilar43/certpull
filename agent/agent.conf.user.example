@@ -45,6 +45,27 @@ EXPECT_DOMAINS=""
 # certpull-issue <hostid> on the server.
 CSR_MODE=""
 
+# --- Transport ---------------------------------------------------------------
+# ssh    (default)  pull over an SSH forced command, as always
+# https             anonymous GET of the published public bundle. Needs no SSH
+#                   key and no outbound port 22, so it works where the only way
+#                   out is an HTTP proxy on 443. CSR mode only -- what gets
+#                   served contains no private key, which is why it needs no
+#                   credentials at all: the agent accepts a bundle only if it
+#                   chains to Let's Encrypt AND matches the private key here.
+#
+# Enrolment with https is a one-time out-of-band step, because the endpoint is
+# read-only:  certpull-agent --print-csr  here, then on the server
+#             certpull-host csr-import <hostid> <file> && certpull-issue <hostid>
+TRANSPORT="ssh"
+
+# https only: the URL from `certpull-host url <hostid>` on the server.
+CERT_URL=""
+
+# https only: an explicit outbound proxy, if that is the only way out.
+# PROXY="http://proxy.example.com:3128"
+PROXY=""
+
 # The key this machine generates for itself in csr mode.
 # ec256 | ec384 | rsa2048 | rsa4096
 AGENT_KEY_TYPE="ec256"

@@ -9,11 +9,19 @@
 #   certpull-host list                                 hosts, mode and domains
 #   certpull-host keys                                 keys and what they may fetch
 #   certpull-host csr [<hostid>]                       state of the submitted CSRs
+#   certpull-host csr-import <hostid> [file]           accept a CSR out-of-band
+#                                                      (file or stdin)
+#   certpull-host token [--rotate] <hostid>            HTTPS path token
+#   certpull-host url <hostid>                         the URL an agent uses
 #   certpull-host doctor                               diagnose the SSH account
 #
 # --csr puts the host in CSR mode: the agent generates its own private key and
 # submits a CSR, and this server never holds the private key. Without it the
 # server generates the key, as it always has.
+#
+# csr-import exists for a host that cannot reach this server over SSH at all:
+# it prints its CSR with `certpull-agent --print-csr`, you bring that one file
+# here once per key, and from then on the host fetches over anonymous HTTPS.
 set -euo pipefail
 
 CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
@@ -23,24 +31,27 @@ source "$CONF"
 : "${HOSTS_DIR:=/etc/certpull/hosts.d}" "${PULL_DIR:=/var/lib/certpull/pull}"
 : "${ACME_ZONE:?}" "${DEFAULT_KEY_TYPE:=ec256}"
 : "${CSR_DIR:=/var/lib/certpull/csr}"
+: "${WWW_DIR:=/var/lib/certpull/www}" "${WWW_BASE_URL:=}"
 GLOBAL_ACME_ZONE="$ACME_ZONE"
 
 AUTHKEYS="/var/lib/certpull/.ssh/authorized_keys"
 SHELLBIN="/usr/local/lib/certpull/certpull-pull-shell"
 
-usage() { sed -n '3,18p' "$0"; exit 2; }
+usage() { sed -n '3,26p' "$0"; exit 2; }
 die()   { echo "certpull-host: $*" >&2; exit 1; }
 
-load_csrlib() {
+load_lib() {                 # $1 = file name
   local l
-  for l in "$LIBDIR/certpull-csrlib.sh" /usr/local/lib/certpull/certpull-csrlib.sh; do
+  for l in "$LIBDIR/$1" "/usr/local/lib/certpull/$1"; do
     if [[ -r $l ]]; then
-      # shellcheck source=certpull-csrlib.sh
+      # shellcheck source=/dev/null
       source "$l"; return 0
     fi
   done
-  die "certpull-csrlib.sh not found (run install-server.sh --update)"
+  die "$1 not found (run install-server.sh --update)"
 }
+load_csrlib() { load_lib certpull-csrlib.sh; }
+load_wwwlib() { load_lib certpull-wwwlib.sh; }
 
 host_mode() {                # $1 = hostid -> csr|full
   local m
@@ -84,6 +95,10 @@ ACME_ZONE="$zone_override"
 #       signs it and never holds the private key. Requires an agent that knows
 #       the "submit" verb.
 CSR_MODE="$csr_mode"
+# Random path component for publishing the PUBLIC bundle over HTTPS. Not a
+# password -- it only stops a stranger enumerating the fleet. Unused unless
+# WWW_BASE_URL is set in certpull.conf and this host is in CSR mode.
+WWW_TOKEN="$(openssl rand -hex 16)"
 EOF
   chmod 0644 "$HOSTS_DIR/$hostid.conf"
   echo "created $HOSTS_DIR/$hostid.conf (mode: $( [[ $csr_mode == yes ]] && echo csr || echo full ))"
@@ -94,6 +109,17 @@ EOF
     echo "    certpull-agent --submit"
     echo "then here:"
     echo "    certpull-issue $hostid"
+    load_wwwlib
+    if www_enabled; then
+      DOMAINS="$*"
+      www_write_config "$hostid" "$DOMAINS" csr "" || true
+      echo
+      echo "HTTPS publishing is on, so this host can skip SSH entirely:"
+      echo "    on the LAN machine:  ./install-agent.sh --https $(www_url "$hostid")"
+      echo "                         certpull-agent --print-csr"
+      echo "    bring that CSR here: certpull-host csr-import $hostid <file>"
+      echo "                         certpull-issue $hostid"
+    fi
   fi
   echo
   exec "$0" cname "$hostid"
@@ -174,6 +200,7 @@ del)
   rm -f "$HOSTS_DIR/$hostid.conf"
   rm -rf "${PULL_DIR:?}/$hostid"
   rm -f "${CSR_DIR:?}/$hostid.csr"
+  load_wwwlib; www_remove "$hostid"
   # drop the hostid from the lists in authorized_keys; remove the whole line
   # only once its list becomes empty
   if [[ -s $AUTHKEYS ]]; then
@@ -200,7 +227,7 @@ del)
 list)
   shopt -s nullglob
   for f in "$HOSTS_DIR"/*.conf; do
-    hostid=$(basename "$f" .conf); DOMAINS=""; ENABLED="yes"; CSR_MODE=""
+    hostid=$(basename "$f" .conf); DOMAINS=""; ENABLED="yes"; CSR_MODE=""; WWW_TOKEN=""
     # shellcheck source=/dev/null
     source "$f"
     haskey=no
@@ -210,8 +237,15 @@ list)
     if [[ $mode == csr ]]; then
       if [[ -s $CSR_DIR/$hostid.csr ]]; then csrst=" csr=ok"; else csrst=" csr=MISSING"; fi
     fi
-    printf '%-22s mode=%-5s enabled=%-4s key=%-4s%s %s\n' \
-      "$hostid" "$mode" "$ENABLED" "$haskey" "$csrst" "$DOMAINS"
+    wwwst=""
+    if [[ $mode == csr ]] && [[ -n ${WWW_BASE_URL:-} ]]; then
+      if [[ -n ${WWW_TOKEN:-} && -s $WWW_DIR/$hostid-$WWW_TOKEN/fullchain.pem ]]; then
+        wwwst=" https=ok"
+      elif [[ -n ${WWW_TOKEN:-} ]]; then wwwst=" https=pending"
+      else wwwst=" https=NOTOKEN"; fi
+    fi
+    printf '%-22s mode=%-5s enabled=%-4s key=%-4s%s%s %s\n' \
+      "$hostid" "$mode" "$ENABLED" "$haskey" "$csrst" "$wwwst" "$DOMAINS"
   done
   ;;
 
@@ -242,6 +276,73 @@ csr)
       printf '%s\n' "$out" | sed 's/^/                       /'
     fi
   done
+  ;;
+
+csr-import)
+  # For a host that cannot reach this server over SSH at all. The CSR goes
+  # through exactly the same authorisation check as a submitted one -- being
+  # carried by a human does not make its names trustworthy.
+  hostid="${1:-}"; valid_id "$hostid"
+  src="${2:--}"
+  [[ -r $HOSTS_DIR/$hostid.conf ]] || die "no $HOSTS_DIR/$hostid.conf"
+  DOMAINS=""; CSR_MODE=""
+  # shellcheck source=/dev/null
+  source "$HOSTS_DIR/$hostid.conf"
+  [[ ${CSR_MODE,,} == yes ]] || die "$hostid is not in CSR mode (set CSR_MODE=\"yes\" first)"
+  load_csrlib
+  tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+  if [[ $src == - ]]; then
+    head -c "$CERTPULL_CSR_MAX_BYTES" > "$tmp"
+  else
+    [[ -r $src ]] || die "cannot read $src"
+    head -c "$CERTPULL_CSR_MAX_BYTES" < "$src" > "$tmp"
+  fi
+  csr_check "$tmp" "$DOMAINS" || die "the CSR was rejected (see above)"
+  install -d -m 0700 -o certpull -g certpull "$CSR_DIR" 2>/dev/null || mkdir -p "$CSR_DIR"
+  install -m 0600 "$tmp" "$CSR_DIR/.staged.$hostid"
+  mv -f "$CSR_DIR/.staged.$hostid" "$CSR_DIR/$hostid.csr"
+  chown certpull:certpull "$CSR_DIR/$hostid.csr" 2>/dev/null || true
+  echo "imported a CSR for $hostid (spki $(csr_spki_sha256 "$CSR_DIR/$hostid.csr"))"
+  echo "now issue it:  certpull-issue $hostid"
+  ;;
+
+token)
+  rotate=0
+  if [[ ${1:-} == --rotate ]]; then rotate=1; shift; fi
+  hostid="${1:-}"; valid_id "$hostid"
+  [[ -r $HOSTS_DIR/$hostid.conf ]] || die "no $HOSTS_DIR/$hostid.conf"
+  load_wwwlib
+  cur="$(www_token_of "$hostid")"
+  if (( rotate )) || [[ -z $cur ]]; then
+    # The old directory goes away first: leaving it behind would keep the
+    # previous URL working for as long as nobody noticed.
+    www_remove "$hostid"
+    new="$(www_new_token)"
+    www_set_token "$hostid" "$new" || die "could not update $HOSTS_DIR/$hostid.conf"
+    if (( rotate )); then
+      echo "rotated the token for $hostid -- the old URL stops working now"
+    else
+      echo "created a token for $hostid"
+    fi
+    cur="$new"
+  fi
+  if www_enabled; then
+    echo "url: $(www_url "$hostid")"
+    echo "re-publish it with:  certpull-issue --force $hostid"
+    echo "and on the LAN machine set:  CERT_URL=\"$(www_url "$hostid")\""
+  else
+    echo "token: $cur   (WWW_BASE_URL is not set, so nothing is published over HTTPS)"
+  fi
+  ;;
+
+url)
+  hostid="${1:-}"; valid_id "$hostid"
+  [[ -r $HOSTS_DIR/$hostid.conf ]] || die "no $HOSTS_DIR/$hostid.conf"
+  load_wwwlib
+  www_enabled || die "WWW_BASE_URL is not set in $CONF -- HTTPS publishing is off"
+  u="$(www_url "$hostid")"
+  [[ -n $u ]] || die "$hostid has no WWW_TOKEN -- run: certpull-host token $hostid"
+  printf '%s\n' "$u"
   ;;
 
 doctor)
@@ -328,6 +429,34 @@ doctor)
          echo "         fix:  chmod 0755 $HOSTS_DIR" ;;
     esac
   fi
+  if [[ -n ${WWW_BASE_URL:-} ]]; then
+    echo "HTTPS publishing:"
+    load_wwwlib
+    if [[ -d $WWW_DIR ]]; then
+      pw=$(stat -c '%a' "$WWW_DIR")
+      case "$pw" in
+        *[1357]) ok "$WWW_DIR is traversable ($pw)" ;;
+        *) bad "$WWW_DIR is $pw -- the web server user cannot read it"
+           echo "         fix:  chmod 0755 $WWW_DIR" ;;
+      esac
+      # The one thing that must never be true.
+      leaked=$(find "$WWW_DIR" -type f \( -name 'privkey*' -o -name '*.key' -o -name 'combined*' \) 2>/dev/null || true)
+      if [[ -n $leaked ]]; then
+        bad "A PRIVATE KEY IS PUBLISHED OVER HTTPS -- remove it now:"
+        printf '         %s\n' $leaked
+      else
+        ok "no private key anywhere under $WWW_DIR"
+      fi
+      orph=$(www_orphans || true)
+      if [[ -n $orph ]]; then
+        warn "directories no host claims any more (old tokens?): $(printf '%s ' $orph)"
+        echo "         remove them by hand once you are sure"
+      fi
+    else
+      warn "$WWW_DIR does not exist yet -- it appears on the first publish"
+    fi
+  fi
+
   # certpull-pull-shell runs as certpull and cannot read certpull.conf, so it
   # falls back to its own compiled-in defaults. If the paths here have been
   # moved, the forced command has to be told -- otherwise submit writes into a

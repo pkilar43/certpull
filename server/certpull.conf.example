@@ -85,6 +85,24 @@ PULL_DIR="/var/lib/certpull/pull"     # what the agents can see over SSH
 CSR_DIR="/var/lib/certpull/csr"
 LOG_TAG="certpull"
 
+# --- Publishing public certificates over HTTPS (optional) -------------------
+# Only hosts in CSR mode are ever published this way, because only their
+# bundles contain no private key. A certificate is public data -- it is already
+# in Certificate Transparency -- so this endpoint needs NO authentication: the
+# agent accepts a bundle only if it chains to Let's Encrypt and matches the
+# private key that never left that machine.
+#
+# What it buys: a LAN host needs no SSH key and no outbound port 22 at all, so
+# it works where the only way out is an HTTP proxy on 443.
+#
+# Empty WWW_BASE_URL = this whole feature is off, which is the default.
+# Set it to the public prefix your web server maps onto WWW_DIR, with no
+# trailing slash, then point nginx or apache at WWW_DIR using
+# nginx-certpull.conf.example / apache-certpull.conf.example.
+WWW_BASE_URL=""
+# WWW_BASE_URL="https://ns-certpull.example.com/certs"
+WWW_DIR="/var/lib/certpull/www"
+
 # --- Notifications (optional) ----------------------------------------------
 # Called when a renewal fails. Receives: $1=hostid $2=message
 # NOTIFY_CMD="/usr/local/lib/certpull/notify-mail"

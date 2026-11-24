@@ -22,6 +22,7 @@ nothing has to be forwarded through NAT or opened on the edge firewall.
 | An agent key may leak | `restrict` + forced command, a whitelist of verbs, and each key sees only its own `hostid` |
 | A tampered or corrupt transfer | `SHA256SUMS`, key/certificate match, `checkend`, `checkhost`, and rollback if the reload fails |
 | A private key should not exist in two places | CSR mode: the agent generates its own key, sends only a CSR, and the server never holds the key |
+| Outbound port 22 is blocked and only a 443 proxy is allowed | the HTTPS transport: the public bundle is served anonymously, and the agent verifies it against its own key |
 
 ---
 
@@ -554,6 +555,10 @@ the first two words are taken and checked against a whitelist:
 | `fetch [hostid]` | a `tar` stream of the published files |
 | `submit [hostid]` | read a CSR on stdin and store it — CSR mode only |
 
+The HTTPS transport has no verbs — it is plain `GET` of static files, and
+`config.json` there is the counterpart of `config` here. See
+[Two transports](#two-transports-ssh-or-anonymous-https).
+
 In every cycle the agent asks `config` once (a few hundred bytes) and only
 downloads the rest when the published fingerprint differs from the locally
 installed one. At 40 hosts × 24 times a day that is still negligible traffic.
@@ -709,6 +714,166 @@ for a new certificate, which is a minute's work and not a recovery procedure.
 
 ---
 
+---
+
+## Two transports: SSH or anonymous HTTPS
+
+A CSR-mode bundle contains no private key, and a certificate is public data —
+it is already in Certificate Transparency. So it can be handed out with **no
+authentication at all**, and that is exactly what the HTTPS transport does.
+
+```bash
+TRANSPORT="ssh"     # default: the original pull over an SSH forced command
+TRANSPORT="https"   # anonymous GET of the published public bundle
+```
+
+| | `ssh` | `https` |
+|---|---|---|
+| Credential on the LAN host | an SSH key, authorised per hostid | **none** |
+| Outbound port needed | 22 | 443, and an HTTP proxy is fine |
+| Works in full mode | yes | no — refuses, by design |
+| Enrolment (first CSR) | `certpull-agent --submit` | out-of-band, once per key |
+| Renewal afterwards | automatic | automatic |
+| What authenticates the result | the same in both: it chains to Let's Encrypt **and** matches the local private key |
+
+### Why this needs no credentials, and why that is not a shortcut
+
+The agent accepts a downloaded bundle only when both of these hold:
+
+1. the certificate chains to Let's Encrypt, which an attacker cannot forge, and
+2. its public key matches the private key that has never left this machine.
+
+Neither condition says anything about where the bytes came from. An attacker
+who owns the web server, the network, or the proxy can refuse to serve a
+certificate — a denial of service, which a monitored expiry date catches — but
+cannot produce one this agent will install, and gains nothing from the server's
+disk, because there is no key material on it for a CSR-mode host.
+
+That is the whole reason this transport exists in this shape. The temptation
+with HTTPS is to reach for mTLS or a bearer token; both would add a credential
+to manage, an expiry to forget, and a secret to leak, in exchange for
+protecting data that is already public.
+
+### The practical reason to use it
+
+Outbound port 22 is blocked on a great many corporate and hospital networks,
+where the only way out is an explicit HTTP proxy on 443. An agent in `https`
+mode needs no SSH key, no `known_hosts`, and no port 22:
+
+```bash
+./install-agent.sh --https "$(certpull-host url srv-web-01)" srv-web-01
+# or with an explicit proxy:
+./install-agent.sh --https "<url>" --proxy http://proxy.example.com:3128 srv-web-01
+```
+
+`curl` picks up `https_proxy` from the environment too, so a proxy configured
+system-wide or in the systemd unit works without `--proxy`.
+
+### Turning it on, on the server
+
+```bash
+# in /etc/certpull/certpull.conf
+WWW_BASE_URL="https://ns-certpull.example.com/certs"
+WWW_DIR="/var/lib/certpull/www"
+```
+
+Empty `WWW_BASE_URL` — the default — means the whole feature is off and nothing
+is written anywhere, so upgrading an existing installation changes nothing.
+
+Then point a web server at `WWW_DIR`. `install-server.sh` deliberately does
+**not** do this for you: taking over a machine's web server is how an installer
+breaks the machine. Two ready configurations are in the repository:
+
+```bash
+cp server/nginx-certpull.conf.example  /etc/nginx/sites-available/certpull
+# or
+cp server/apache-certpull.conf.example /etc/apache2/sites-available/certpull.conf
+```
+
+Both switch off directory listing, allow only `GET` and `HEAD`, refuse to
+follow symlinks out of the tree, and set a five-minute cache. The vhost's own
+TLS certificate can be one certpull issues for itself — there is no
+circularity, because DNS-01 does not depend on this vhost existing:
+
+```bash
+certpull-host add certpull-self ns-certpull.example.com
+certpull-issue certpull-self
+```
+
+### The URL, and what the token in it is for
+
+```bash
+$ certpull-host url srv-web-01
+https://ns-certpull.example.com/certs/srv-web-01-9f2c4e8a1b7d6053c4a1e9f28b3d7c65
+```
+
+The path is `<hostid>-<token>` with 128 random bits, generated by
+`certpull-host add` and stored as `WWW_TOKEN` in the host file.
+
+**The token is not a password and nothing is allowed to depend on it being
+one.** Its only job is to stop a stranger *enumerating* the fleet: without it,
+anybody who guessed a hostid could read which internal host serves which
+customer's names. The certificates themselves are public either way. So treat a
+leaked token as an information-disclosure annoyance rather than a breach, and
+rotate it when you want to:
+
+```bash
+certpull-host token --rotate srv-web-01   # the old URL stops working at once
+certpull-issue --force srv-web-01         # republish under the new one
+```
+
+An agent left on the old URL fails loudly on its next run rather than quietly
+serving a stale certificate until it expires.
+
+### Enrolment, once per key
+
+The endpoint is read-only, so the CSR cannot travel over it. That is a
+deliberate limit: accepting a CSR would mean authenticating the writer, which
+is the problem this transport exists to avoid. Enrolment is one manual step:
+
+```bash
+# on the LAN machine
+certpull-agent --print-csr > srv-web-01.csr
+
+# bring that one file to the server
+certpull-host csr-import srv-web-01 srv-web-01.csr
+certpull-issue srv-web-01
+```
+
+`csr-import` runs the CSR through exactly the same authorisation check as a
+submitted one — being carried by a human does not make its names trustworthy.
+After this the host renews itself indefinitely with no credentials at all. You
+only come back here if you rotate the key (`certpull-agent --rotate-key`).
+
+### What gets published
+
+```
+WWW_DIR/<hostid>-<token>/
+    config.json      mode, domains, key type -- the HTTPS counterpart of the
+                     SSH "config" verb, written when the host is added so an
+                     agent can build its first CSR before anything is issued
+    meta.json        fingerprint, SPKI, not_after, domains
+    cert.pem         the leaf
+    chain.pem        the issuer
+    fullchain.pem    leaf + issuer
+    SHA256SUMS
+```
+
+Never a private key. The publishing code copies an explicit list of files,
+never a glob, refuses any host not in CSR mode, and refuses outright if
+anything key-shaped is present in the source directory. On top of that, every
+agent on the endpoint probes for `privkey.pem` on **every** run and aborts with
+an unmistakable message if one appears — which makes the fleet a free detector
+for that mistake. `certpull-host doctor` checks for it as well.
+
+### Both transports at once
+
+They are per profile, not per host, so one machine can use SSH for one
+certificate and HTTPS for another, and a host can be moved between them by
+editing `TRANSPORT` and `CERT_URL`. The server does not care: it publishes to
+the pull directory and to the HTTPS tree from the same `certpull-issue` run.
+
+
 ## Renewal and 45-day certificates
 
 Let's Encrypt is shortening certificate lifetimes to 45 days. The default
@@ -767,12 +932,15 @@ server/
   certpull.conf.example      → /etc/certpull/certpull.conf
   hosts.d/example.conf       → /etc/certpull/hosts.d/<hostid>.conf
   certpull-issue             → /usr/local/sbin/          (renewal + publishing)
-  certpull-host              → /usr/local/sbin/          (add/key/cname/del/list/keys/csr/doctor)
+  certpull-host              → /usr/local/sbin/          (add/key/cname/del/list/keys/csr/csr-import/token/url/doctor)
   certpull-zone              → /usr/local/sbin/          (add/list/show/del/soa-min)
   certpull-verify            → /usr/local/sbin/          (end-to-end delegation test)
   certpull-status            → /usr/local/sbin/
   certpull-pull-shell        → /usr/local/lib/certpull/  (forced command)
   certpull-csrlib.sh         → /usr/local/lib/certpull/  (CSR authorisation, sourced by both)
+  certpull-wwwlib.sh         → /usr/local/lib/certpull/  (HTTPS publishing)
+  nginx-certpull.conf.example    a vhost serving WWW_DIR read-only
+  apache-certpull.conf.example   the same for Apache
   knot.conf.example          → /etc/knot/knot.conf
   acme-zone.example          → /var/lib/knot/<zone>.zone
   systemd/certpull-renew.{service,timer}
@@ -1059,3 +1227,39 @@ sudo ufw disable
 ```
 
 And check `./install-server.sh --show-firewall-plan` before the next install.
+
+### HTTPS transport
+
+**`cannot read .../config.json`** — the wrong `CERT_URL`, a rotated token, or
+`WWW_BASE_URL` not set on the server. Get the current URL there:
+
+```bash
+certpull-host url <hostid>
+```
+
+**`is serving privkey.pem -- a private key must never be on this endpoint`** —
+stop and deal with it: the web server is handing out a private key. Check what
+is actually in the tree, remove it, rotate the affected key, and find out how
+it got there:
+
+```bash
+sudo find /var/lib/certpull/www -name 'privkey*' -o -name '*.key'
+sudo certpull-host doctor
+```
+
+certpull itself does not put one there — only CSR-mode hosts are published and
+their bundles have none — so the usual cause is a web server alias pointing at
+`PULL_DIR` instead of `WWW_DIR`.
+
+**`says mode=full -- the HTTPS transport only ever serves CSR-mode bundles`** —
+the host is not in CSR mode on the server, so there is nothing safe to publish
+anonymously. Either set `CSR_MODE="yes"` for it, or keep that host on SSH.
+
+**A certificate never arrives, and `--check` says NEEDS ENROLMENT** — the CSR
+has not reached the server. The endpoint is read-only on purpose:
+
+```bash
+certpull-agent --print-csr > /tmp/<hostid>.csr      # here
+certpull-host csr-import <hostid> /tmp/<hostid>.csr # there
+certpull-issue <hostid>
+```

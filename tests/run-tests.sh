@@ -49,6 +49,16 @@ agent_run() {                # $1 = profile, rest = flags
 }
 mkdir -p "$T/tmp"
 
+rewrite_meta() {             # $1 = meta.json, $2 = fingerprint, $3 = spki
+  python3 -c '
+import re,sys
+p,fp,spki=sys.argv[1:4]
+s=open(p).read()
+s=re.sub(r"\"fingerprint_sha256\":\"[^\"]*\"","\"fingerprint_sha256\":\"%s\""%fp,s)
+s=re.sub(r"\"spki_sha256\":\"[^\"]*\"","\"spki_sha256\":\"%s\""%spki,s)
+open(p,"w").write(s)' "$1" "$2" "$3"
+}
+
 spki_key()  { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -hex | sed 's/.*= *//'; }
 spki_cert() { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex | sed 's/.*= *//'; }
 
@@ -450,7 +460,13 @@ echo "$out" | grep -q "DOMAINS changed"; r=$?; [[ $r != 0 ]]; chk $? "and it doe
 hdr "16. install-server.sh --update --dry-run"
 grep -q 'certpull-csrlib.sh' "$REPO/server/install-server.sh"; chk $? "the installer ships certpull-csrlib.sh"
 grep -q 'install_csr_dir' "$REPO/server/install-server.sh"; chk $? "the installer creates the CSR directory"
-grep -qE 'SAFE_SEED=.*CSR_DIR|CSR_DIR \)' "$REPO/server/install-server.sh"; chk $? "CSR_DIR is seeded into an existing config"
+safe_seed_has() {            # the array spans several lines, so flatten it first
+  sed -n '/^SAFE_SEED=(/,/)/p' "$REPO/server/install-server.sh" | tr -s ' \n' ' ' | grep -qw "$1"
+}
+safe_seed_has CSR_DIR;      chk $? "CSR_DIR is seeded into an existing config"
+safe_seed_has WWW_DIR;      chk $? "so is WWW_DIR"
+safe_seed_has WWW_BASE_URL; chk $? "and WWW_BASE_URL"
+grep -q 'certpull-wwwlib.sh' "$REPO/server/install-server.sh"; chk $? "the installer ships certpull-wwwlib.sh"
 grep -q '^CSR_DIR=' "$REPO/server/certpull.conf.example"; chk $? "and exists in the template"
 grep -q '^CSR_MODE=' "$REPO/server/hosts.d/example.conf"; chk $? "CSR_MODE is documented in the host template"
 # every sed pattern in the installers must match a line that really exists
@@ -497,6 +513,131 @@ echo "$plan" | grep -q '(nothing else)'; chk $? "without ss it detects nothing i
 grep -q -- '--no-ufw' "$REPO/server/install-server.sh"; chk $? "--no-ufw exists"
 grep -q 'was_active' "$REPO/server/install-server.sh"; chk $? "an already-active ufw is not re-enabled"
 rm -f "$T/bin/ss"
+
+hdr "18. publishing public bundles over HTTPS"
+WWW="$T/var/lib/certpull/www"
+
+# Off by default: nothing above this point configured WWW_BASE_URL, and nothing
+# should have been published.
+[[ ! -d $WWW ]] || [[ -z $(ls -A "$WWW" 2>/dev/null) ]]; chk $? "HTTPS publishing is off until WWW_BASE_URL is set"
+
+echo 'WWW_BASE_URL="https://stub/certs"' >> "$T/etc/certpull/certpull.conf"
+echo "WWW_DIR=\"$WWW\""                  >> "$T/etc/certpull/certpull.conf"
+
+# A brand new host, created the way an operator would, so it gets a token.
+out=$("$HOST" add --csr h-https h.example.com alt.h.example.com 2>&1); chk $? "certpull-host add --csr h-https"
+echo "$out" | grep -q 'install-agent.sh --https'; chk $? "add tells you the HTTPS one-liner"
+tok=$(sed -n 's/^WWW_TOKEN="\(.*\)"/\1/p' "$T/etc/certpull/hosts.d/h-https.conf")
+[[ ${#tok} == 32 ]]; chk $? "a 128-bit path token was generated (${#tok} hex chars)"
+URL=$("$HOST" url h-https); chk $? "certpull-host url prints the URL"
+[[ $URL == "https://stub/certs/h-https-$tok" ]]; chk $? "the URL is <base>/<hostid>-<token>"
+[[ -s $WWW/h-https-$tok/config.json ]]; chk $? "config.json exists before anything is issued"
+grep -q '"mode":"csr"' "$WWW/h-https-$tok/config.json"; chk $? "and says mode=csr"
+grep -q 'alt.h.example.com' "$WWW/h-https-$tok/config.json"; chk $? "and carries the authorised domains"
+
+# The invariant: a full-mode host must never appear here.
+"$ISSUE" --force a-full >/dev/null 2>&1
+[[ -z $(find "$WWW" -maxdepth 1 -name 'a-full-*' 2>/dev/null) ]]; chk $? "a FULL-mode host is never published over HTTPS"
+[[ -z $(find "$WWW" -type f -name 'privkey*' 2>/dev/null) ]]; chk $? "no privkey.pem anywhere under WWW_DIR"
+
+hdr "19. the agent over HTTPS, end to end"
+cat > "$T/agenthome/.config/certpull/https.conf" <<AGENTEOF
+HOSTID="h-https"
+TRANSPORT="https"
+CERT_URL="$URL"
+DEST="$T/agenthome/certs-https"
+DEST_MODE="0700"
+FILE_STYLE="pem"
+CSR_MODE="yes"
+AGENT_KEY_TYPE="ec256"
+RELOAD_CMD=""
+AGENTEOF
+
+out=$(agent_run https 2>&1); rc=$?
+[[ $rc == 0 ]]; chk $? "the first run succeeds without any SSH key (rc=$rc)"
+echo "$out" | grep -q 'generated a new ec256 private key'; chk $? "it generated its own key"
+echo "$out" | grep -q 'has no way to send one'; chk $? "and says the endpoint is read-only"
+echo "$out" | grep -q 'certpull-host csr-import'; chk $? "with the exact enrolment commands"
+HD="$T/agenthome/certs-https"
+[[ -s $HD/.pending.privkey.pem && ! -e $HD/privkey.pem ]]; chk $? "the key is pending, nothing installed"
+HSPKI=$(spki_key "$HD/.pending.privkey.pem")
+
+out=$(agent_run https --check 2>&1)
+echo "$out" | grep -q 'transport: https'; chk $? "--check names the transport"
+echo "$out" | grep -q 'NEEDS ENROLMENT'; chk $? "--check says enrolment is needed"
+
+agent_run https --print-csr > "$T/h-https.csr" 2>/dev/null; chk $? "--print-csr writes a CSR"
+openssl req -in "$T/h-https.csr" -noout -verify >/dev/null 2>&1; chk $? "it is a valid CSR"
+csrspki=$(openssl req -in "$T/h-https.csr" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex | sed 's/.*= *//')
+[[ $csrspki == "$HSPKI" ]]; chk $? "for the key this machine holds"
+
+out=$("$HOST" csr-import h-https "$T/h-https.csr" 2>&1); chk $? "csr-import accepts it"
+echo "$out" | grep -q "$HSPKI"; chk $? "and reports the same SPKI"
+
+out=$("$ISSUE" h-https 2>&1); chk $? "certpull-issue signs it"
+echo "$out" | grep -q 'also published over HTTPS'; chk $? "and says it published over HTTPS"
+[[ -s $WWW/h-https-$tok/fullchain.pem ]]; chk $? "fullchain.pem is on the endpoint"
+[[ -s $WWW/h-https-$tok/SHA256SUMS ]]; chk $? "so is SHA256SUMS"
+[[ ! -e $WWW/h-https-$tok/privkey.pem ]]; chk $? "and no private key"
+[[ -s $WWW/h-https-$tok/config.json ]]; chk $? "config.json survived the atomic swap"
+
+out=$(agent_run https 2>&1); rc=$?
+[[ $rc == 0 ]]; chk $? "the agent installs over HTTPS (rc=$rc)"
+echo "$out" | grep -q 'over https'; chk $? "and says which transport it used"
+[[ -s $HD/privkey.pem && ! -e $HD/.pending.privkey.pem ]]; chk $? "the pending key was promoted"
+[[ "$(spki_key "$HD/privkey.pem")" == "$HSPKI" ]]; chk $? "the active key is the one generated here"
+[[ "$(spki_key "$HD/privkey.pem")" == "$(spki_cert "$HD/cert.pem")" ]]; chk $? "key and certificate match"
+out=$(agent_run https 2>&1); echo "$out" | grep -q 'up to date'; chk $? "the next run is a no-op"
+
+hdr "20. HTTPS: what a compromised endpoint cannot do"
+# A correctly-chained certificate for a key the agent does not hold, with
+# SHA256SUMS and meta.json made consistent -- the strongest a hostile server or
+# a hostile network can manage without the agent's private key.
+EK=$(mktemp); openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$EK" 2>/dev/null
+ECSR=$(mktemp); EEXT=$(mktemp)
+openssl req -new -key "$EK" -subj "/CN=h.example.com" -out "$ECSR" 2>/dev/null
+printf 'subjectAltName=DNS:h.example.com,DNS:alt.h.example.com\n' > "$EEXT"
+openssl x509 -req -in "$ECSR" -CA "$T/ca/int.crt" -CAkey "$T/ca/int.key" -set_serial 4242 \
+  -days 90 -extfile "$EEXT" -out "$WWW/h-https-$tok/cert.pem" 2>/dev/null
+cat "$WWW/h-https-$tok/cert.pem" "$T/ca/int.crt" > "$WWW/h-https-$tok/fullchain.pem"
+EFP=$(openssl x509 -in "$WWW/h-https-$tok/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+ESPKI=$(spki_cert "$WWW/h-https-$tok/cert.pem")
+rewrite_meta "$WWW/h-https-$tok/meta.json" "$EFP" "$ESPKI"
+( cd "$WWW/h-https-$tok" && sha256sum cert.pem chain.pem fullchain.pem meta.json > SHA256SUMS )
+BEFORE=$(spki_cert "$HD/cert.pem")
+out=$(agent_run https 2>&1); rc=$?
+[[ "$(spki_cert "$HD/cert.pem")" == "$BEFORE" ]]; chk $? "a certificate for a foreign key is NOT installed"
+[[ "$(spki_key "$HD/privkey.pem")" == "$HSPKI" ]]; chk $? "the local key is untouched"
+[[ $rc == 0 ]]; chk $? "and the run does not hard-fail, it asks for enrolment again"
+rm -f "$EK" "$ECSR" "$EEXT"
+
+# A private key appearing on the endpoint has to stop the agent dead -- from a
+# clean endpoint, so this tests the leak and not the previous tamper.
+"$ISSUE" --force h-https >/dev/null 2>&1; agent_run https >/dev/null 2>&1
+cp "$HD/privkey.pem" "$WWW/h-https-$tok/privkey.pem"
+out=$(agent_run https --force 2>&1); rc=$?
+[[ $rc != 0 ]]; chk $? "a private key on the endpoint aborts the run"
+echo "$out" | grep -q 'must never be on this endpoint'; chk $? "with an unmistakable message"
+out=$("$HOST" doctor 2>&1 || true)
+echo "$out" | grep -q 'A PRIVATE KEY IS PUBLISHED OVER HTTPS'; chk $? "doctor screams about it too"
+rm -f "$WWW/h-https-$tok/privkey.pem"
+"$ISSUE" --force h-https >/dev/null 2>&1; agent_run https >/dev/null 2>&1
+
+hdr "21. token rotation and removal"
+out=$("$HOST" token --rotate h-https 2>&1); chk $? "token --rotate"
+newtok=$(sed -n 's/^WWW_TOKEN="\(.*\)"/\1/p' "$T/etc/certpull/hosts.d/h-https.conf")
+[[ -n $newtok && $newtok != "$tok" ]]; chk $? "the token really changed"
+[[ ! -d $WWW/h-https-$tok ]]; chk $? "the old directory is gone, so the old URL stops working"
+out=$(agent_run https 2>&1); rc=$?
+[[ $rc != 0 ]]; chk $? "an agent still on the old URL fails loudly instead of going quietly stale"
+echo "$out" | grep -q 'certpull-host url'; chk $? "and is told where to get the new one"
+sed -i "s|^CERT_URL=.*|CERT_URL=\"https://stub/certs/h-https-$newtok\"|" "$T/agenthome/.config/certpull/https.conf"
+"$ISSUE" --force h-https >/dev/null 2>&1; chk $? "re-publishing under the new token"
+out=$(agent_run https 2>&1); rc=$?
+[[ $rc == 0 ]]; chk $? "the agent works again on the new URL (rc=$rc)"
+
+"$HOST" del h-https >/dev/null 2>&1; chk $? "certpull-host del"
+[[ -z $(find "$WWW" -maxdepth 1 -name 'h-https-*' 2>/dev/null) ]]; chk $? "del removed the published directory"
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 if [[ $KEEP == 0 && -d $T ]]; then rm -rf "$T"; else echo "sandbox kept at $T"; fi

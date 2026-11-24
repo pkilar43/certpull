@@ -9,9 +9,20 @@
 #   certpull-agent --remote-list  -> ask the server what this key may fetch
 #   certpull-agent --submit       -> (CSR mode) generate the key if needed and
 #                                    send a fresh CSR, then stop
+#   certpull-agent --print-csr    -> (CSR mode) print the CSR on stdout for
+#                                    out-of-band enrolment, change nothing else
 #   certpull-agent --rotate-key   -> (CSR mode) make a NEW private key and ask
 #                                    for a certificate on it; the old key stays
 #                                    in use until the new certificate arrives
+#
+# Two transports, set with TRANSPORT in the configuration file:
+#
+#   ssh    (default)  the original pull over an SSH forced command
+#   https             anonymous GET of the published public bundle. Needs no
+#                     SSH key and no outbound port 22, so it works where the
+#                     only way out is an HTTP proxy on 443. CSR mode only --
+#                     there is no private key in what gets served. Enrolment is
+#                     out-of-band: --print-csr here, csr-import on the server.
 #
 # It works in two modes, detected from the UID:
 #
@@ -69,8 +80,33 @@ fi
 # shellcheck source=/dev/null
 source "$CONF"
 
-: "${SERVER:?}" "${HOSTID:?}"
+: "${HOSTID:?}"
 : "${SERVER_PORT:=22}"
+# ssh (default) | https -- see the header.
+: "${TRANSPORT:=ssh}"
+TRANSPORT="${TRANSPORT,,}"
+# https only: the base URL `certpull-host url <hostid>` printed on the server.
+: "${CERT_URL:=}"
+# https only: an explicit outbound proxy, for networks where that is the only
+# way out. Equivalent to setting https_proxy in the unit's environment.
+: "${PROXY:=}"
+
+case "$TRANSPORT" in
+  ssh)
+    : "${SERVER:?SERVER is required with TRANSPORT=ssh}"
+    ;;
+  https)
+    : "${CERT_URL:?CERT_URL is required with TRANSPORT=https (get it from: certpull-host url $HOSTID)}"
+    CERT_URL="${CERT_URL%/}"
+    # Not because the payload needs it -- it verifies itself against the local
+    # private key -- but because a plain http:// URL here is far more likely to
+    # be a typo than a decision.
+    [[ $CERT_URL == https://* ]] || { echo "CERT_URL must start with https:// (got: $CERT_URL)" >&2; exit 1; }
+    : "${SERVER:=}"
+    ;;
+  *)
+    echo "TRANSPORT must be ssh or https (got: $TRANSPORT)" >&2; exit 1 ;;
+esac
 
 # --- defaults that depend on the mode ---------------------------------------
 if (( AM_ROOT )); then
@@ -105,15 +141,16 @@ fi
 
 LOCK="$LOCK_DIR/certpull-agent.$(basename "$CONF" .conf).lock"
 
-FORCE=0; CHECK=0; RLIST=0; SUBMIT_ONLY=0; ROTATE=0
+FORCE=0; CHECK=0; RLIST=0; SUBMIT_ONLY=0; ROTATE=0; PRINT_CSR=0
 for a in "$@"; do
   case "$a" in
     --force) FORCE=1 ;;
     --check) CHECK=1 ;;
     --remote-list) RLIST=1 ;;
     --submit) SUBMIT_ONLY=1 ;;
+    --print-csr) PRINT_CSR=1 ;;
     --rotate-key) ROTATE=1 ;;
-    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -151,19 +188,35 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 exec 9>"$LOCK"
 flock -n 9 || { log "another instance is already running"; exit 0; }
 
-SSH=( ssh
-      -p "$SERVER_PORT"
-      -i "$SSH_KEY"
-      -o IdentitiesOnly=yes
-      -o UserKnownHostsFile="$KNOWN_HOSTS"
-      -o StrictHostKeyChecking=yes
-      -o BatchMode=yes
-      -o ConnectTimeout=15
-      -o ServerAliveInterval=10
-      -o ServerAliveCountMax=3
-      "$SERVER" )
+SSH=()
+HTTP=()
+if [[ $TRANSPORT == ssh ]]; then
+  SSH=( ssh
+        -p "$SERVER_PORT"
+        -i "$SSH_KEY"
+        -o IdentitiesOnly=yes
+        -o UserKnownHostsFile="$KNOWN_HOSTS"
+        -o StrictHostKeyChecking=yes
+        -o BatchMode=yes
+        -o ConnectTimeout=15
+        -o ServerAliveInterval=10
+        -o ServerAliveCountMax=3
+        "$SERVER" )
+else
+  command -v curl >/dev/null || { echo "TRANSPORT=https needs curl" >&2; exit 1; }
+  if [[ -n $PROXY ]]; then export https_proxy="$PROXY" HTTPS_PROXY="$PROXY"; fi
+  # --proto '=https' so a redirect cannot walk this down to plain HTTP, and no
+  # -L at all: the published tree is static and a redirect would mean the URL
+  # is wrong. Short timeouts with two retries suit a twice-daily timer.
+  HTTP=( curl -fsS --proto '=https' --tlsv1.2
+         --max-time 60 --connect-timeout 15 --retry 2 --retry-delay 3 )
+fi
 
 json() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
+http_get() {                 # $1 = file name under CERT_URL -> body on stdout
+  "${HTTP[@]}" "$CERT_URL/$1"
+}
 
 spki_of_key() {
   [[ -s ${1:-} ]] || return 0
@@ -177,12 +230,16 @@ spki_of_cert() {
 }
 
 if (( RLIST )); then
+  [[ $TRANSPORT == ssh ]] || die "--remote-list needs TRANSPORT=ssh (over https there is nothing to ask)"
   echo "hostids available to this key:"
   "${SSH[@]}" list || die "the server does not support 'list' (an old pull-shell?)"
   exit 0
 fi
 
-[[ -r $SSH_KEY ]] || die "cannot read the key $SSH_KEY (running as $MYUSER)"
+# Only the SSH transport has a key to read. That is the point of the other one.
+if [[ $TRANSPORT == ssh ]]; then
+  [[ -r $SSH_KEY ]] || die "cannot read the key $SSH_KEY (running as $MYUSER)"
+fi
 
 # --- 1. what the server says ------------------------------------------------
 # "config" is asked FIRST and is the authority on the mode and the domains,
@@ -195,8 +252,59 @@ fi
 # the same cost as the single "meta" call this used to make.
 REMOTE_FP=""; REMOTE_NA=""; REMOTE_DOMAINS=""; REMOTE_SPKI=""; MODE=""; CSR_STATE=""
 
+https_assert_no_private_key() {
+  # Run on EVERY https cycle, not only when something is about to be installed.
+  # A server publishing a private key is an emergency whether or not this agent
+  # happens to want that certificate today, and every agent polling the
+  # endpoint is a free detector for it.
+  local f
+  for f in privkey.pem combined.pem "$HOSTID.key"; do
+    if "${HTTP[@]}" -o /dev/null -I "$CERT_URL/$f" >/dev/null 2>&1; then
+      die "$CERT_URL is serving $f -- a private key must never be on this endpoint. Tell whoever runs the server, now."
+    fi
+  done
+}
+
+read_https_meta() {          # the published state, from meta.json over HTTPS
+  local m
+  if m=$(http_get meta.json 2>/dev/null); then
+    REMOTE_FP=$(printf '%s' "$m" | json fingerprint_sha256)
+    REMOTE_SPKI=$(printf '%s' "$m" | json spki_sha256)
+    REMOTE_NA=$(printf '%s' "$m" | json not_after)
+    # config.json's domain list wins: that is what the host is authorised for,
+    # while meta.json describes whatever happened to be issued last.
+    [[ -n $REMOTE_DOMAINS ]] || REMOTE_DOMAINS=$(printf '%s' "$m" | json domains)
+  else
+    # Normal before the first issuance: config.json exists from the moment the
+    # host was added, meta.json only once something has been signed.
+    REMOTE_FP=""; REMOTE_SPKI=""; REMOTE_NA=""
+  fi
+}
+
 ask_config() {               # (re)read mode + domains + published state
   local out
+  if [[ $TRANSPORT == https ]]; then
+    # config.json is the HTTPS counterpart of the SSH "config" verb, and exists
+    # for the same reason: an agent has to be able to learn which names it is
+    # authorised for before anything has been issued for it.
+    if ! out=$(http_get config.json 2>/dev/null); then
+      die "cannot read $CERT_URL/config.json -- wrong CERT_URL or token? is WWW_BASE_URL set on the server? (certpull-host url $HOSTID)"
+    fi
+    MODE=$(printf '%s' "$out" | json mode)
+    REMOTE_DOMAINS=$(printf '%s' "$out" | json domains)
+    : "${MODE:=csr}"
+    # Nothing served over this transport may contain a private key, so a server
+    # claiming full mode here is either misconfigured or not the server we
+    # think it is. Either way, do not proceed.
+    [[ $MODE == csr ]] || die "$CERT_URL says mode=$MODE -- the HTTPS transport only ever serves CSR-mode bundles"
+    # There is no stored-CSR state to report over a read-only transport; a
+    # mismatch between config.json's domains and the certificate is caught by
+    # the name check below instead.
+    CSR_STATE=""
+    https_assert_no_private_key
+    read_https_meta
+    return 0
+  fi
   if ! out=$("${SSH[@]}" "config $HOSTID" 2>/dev/null); then
     if [[ ${CSR_MODE,,} == yes ]]; then
       die "this server does not know the 'config' verb -- it is too old for CSR mode (run install-server.sh --update there)"
@@ -219,7 +327,8 @@ ask_config() {               # (re)read mode + domains + published state
 
 if ! ask_config; then
   # An old server, which only knows "meta". Such a server can only ever be in
-  # full mode, since CSR mode did not exist there.
+  # full mode, since CSR mode did not exist there. Not reachable with
+  # TRANSPORT=https, where ask_config either succeeds or dies.
   META=$("${SSH[@]}" "meta $HOSTID" 2>/dev/null) \
     || die "cannot reach $HOSTID on $SERVER (key? known_hosts? permission for this hostid? nothing published yet?)"
   REMOTE_FP=$(printf '%s' "$META" | json fingerprint_sha256)
@@ -283,8 +392,26 @@ build_csr() {                # $1 = key file, $2 = output CSR; uses REMOTE_DOMAI
     || die "could not build a CSR for $REMOTE_DOMAINS"
 }
 
+print_csr() {                # $1 = key file -> the CSR on stdout
+  local key="$1" csr
+  csr=$(mktemp "${TMPDIR:-/tmp}/certpull-csr.XXXXXX")
+  build_csr "$key" "$csr"
+  cat "$csr"
+  rm -f "$csr"
+}
+
 submit_csr() {               # $1 = key file to request a certificate for
   local key="$1" csr out
+  if [[ $TRANSPORT != ssh ]]; then
+    # Deliberate: the HTTPS endpoint is anonymous and read-only. Accepting a
+    # CSR there would mean authenticating the writer, which is exactly the
+    # problem this transport exists to avoid. Enrolment is a one-time step.
+    log "$HOSTID: a new CSR is needed, but TRANSPORT=https has no way to send one."
+    log "          here:        certpull-agent --print-csr > $HOSTID.csr"
+    log "          the server:  certpull-host csr-import $HOSTID $HOSTID.csr"
+    log "                       certpull-issue $HOSTID"
+    return 1
+  fi
   csr=$(mktemp "${TMPDIR:-/tmp}/certpull-csr.XXXXXX")
   build_csr "$key" "$csr"
   if out=$("${SSH[@]}" "submit $HOSTID" < "$csr" 2>&1); then
@@ -363,6 +490,12 @@ if (( CHECK )); then
   echo "profile:   $(basename "$CONF")"
   echo "user:      $MYUSER"
   echo "host:      $HOSTID"
+  if [[ $TRANSPORT == https ]]; then
+    echo "transport: https (anonymous GET, no SSH key needed)"
+    echo "url:       $CERT_URL"
+  else
+    echo "transport: ssh ($SERVER)"
+  fi
   echo "mode:      $mode_note"
   echo "domains:   $REMOTE_DOMAINS"
   echo "expires:   ${REMOTE_NA:-(nothing published)}"
@@ -374,7 +507,9 @@ if (( CHECK )); then
     else                        echo "key:       (none yet -- the next run generates one)"; fi
     if [[ -n $PEN_SPKI ]]; then echo "           pending $PEN_SPKI -- waiting for a certificate"; fi
   fi
-  if   [[ -z $REMOTE_FP ]];             then echo "state:     WAITING (nothing published for this host yet)"
+  if   (( NEED_SUBMIT )) && [[ $TRANSPORT == https ]]; then
+                                             echo "state:     NEEDS ENROLMENT (certpull-agent --print-csr, then csr-import on the server)"
+  elif [[ -z $REMOTE_FP ]];             then echo "state:     WAITING (nothing published for this host yet)"
   elif (( NEED_SUBMIT ));               then echo "state:     NEEDS A CSR SUBMISSION (certpull-agent --submit)"
   elif [[ $LOCAL_FP == "$REMOTE_FP" ]]; then echo "state:     up to date"
   else                                       echo "state:     NEEDS UPDATE"
@@ -382,8 +517,20 @@ if (( CHECK )); then
   exit 0
 fi
 
+if (( PRINT_CSR )); then
+  [[ $MODE == csr ]] || die "$HOSTID is in full mode -- there is no CSR to print"
+  if [[ ! -s ${WANT_KEY:-/nonexistent} ]]; then WANT_KEY="$KEY_PENDING"; gen_key "$KEY_PENDING"; fi
+  print_csr "$WANT_KEY"
+  log "$HOSTID: CSR for $(basename "$WANT_KEY") ($(spki_of_key "$WANT_KEY"))"
+  log "          on the server:  certpull-host csr-import $HOSTID <file> && certpull-issue $HOSTID"
+  exit 0
+fi
+
 if (( SUBMIT_ONLY )); then
   [[ $MODE == csr ]] || die "$HOSTID is in full mode -- there is no CSR to submit"
+  if [[ $TRANSPORT != ssh ]]; then
+    die "TRANSPORT=https cannot submit -- use --print-csr and certpull-host csr-import on the server"
+  fi
   # No refresh needed: MODE and REMOTE_DOMAINS already came from the host file
   # through "config" a moment ago, which is the authoritative source.
   if [[ ! -s ${WANT_KEY:-/nonexistent} ]]; then WANT_KEY="$KEY_PENDING"; gen_key "$KEY_PENDING"; fi
@@ -417,10 +564,23 @@ do_install() {
   cleanup() { rm -rf "$TMP"; }
   trap cleanup EXIT
 
-  log "$HOSTID: fetching a new certificate ($REMOTE_FP)"
-  "${SSH[@]}" "fetch $HOSTID" > "$TMP/bundle.tar" || die "the download failed"
-  tar -C "$TMP" -xf "$TMP/bundle.tar" || die "corrupt archive"
-  rm -f "$TMP/bundle.tar"
+  log "$HOSTID: fetching a new certificate over $TRANSPORT ($REMOTE_FP)"
+  if [[ $TRANSPORT == https ]]; then
+    # One file at a time rather than an archive: the published tree is static,
+    # and SHA256SUMS still has to account for every one of them, so a partial
+    # or swapped download cannot get past the checks below.
+    for f in SHA256SUMS meta.json cert.pem chain.pem fullchain.pem; do
+      http_get "$f" > "$TMP/$f" 2>/dev/null \
+        || die "cannot download $CERT_URL/$f"
+    done
+    # Checked again here, immediately before anything is written: cheap, and it
+    # covers the window since the check at the start of the run.
+    https_assert_no_private_key
+  else
+    "${SSH[@]}" "fetch $HOSTID" > "$TMP/bundle.tar" || die "the download failed"
+    tar -C "$TMP" -xf "$TMP/bundle.tar" || die "corrupt archive"
+    rm -f "$TMP/bundle.tar"
+  fi
 
   # --- 4. verification (nothing lands in the destination before this step) ---
   ( cd "$TMP" && sha256sum -c --status SHA256SUMS ) || die "checksums do not match"
@@ -555,11 +715,18 @@ if (( INSTALL )); then do_install; fi
 # gets installed first, and only then does the next rotation start.
 if (( NEED_SUBMIT )); then
   if [[ ! -s ${WANT_KEY:-/nonexistent} ]]; then WANT_KEY="$KEY_PENDING"; gen_key "$KEY_PENDING"; fi
-  submit_csr "$WANT_KEY"
-  if [[ -z $REMOTE_FP ]]; then
-    log "$HOSTID: CSR sent, waiting for the first certificate"
+  if submit_csr "$WANT_KEY"; then
+    if [[ -z $REMOTE_FP ]]; then
+      log "$HOSTID: CSR sent, waiting for the first certificate"
+    else
+      log "$HOSTID: CSR sent for the new key; the current certificate stays in use until it is signed"
+    fi
   else
-    log "$HOSTID: CSR sent for the new key; the current certificate stays in use until it is signed"
+    # Over HTTPS this is not a failure of this run: the certificate currently
+    # installed is still valid and still in use, and enrolment is a human step
+    # whose instructions submit_csr has just printed. Exiting non-zero would
+    # paint the timer red every twelve hours until somebody did it.
+    [[ $TRANSPORT == ssh ]] && die "could not submit the CSR" || true
   fi
 fi
 

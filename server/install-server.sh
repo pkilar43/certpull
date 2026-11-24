@@ -101,7 +101,7 @@ LIB_SCRIPTS=( certpull-pull-shell )
 # Sourced, not executed: the CSR authorisation rule shared by certpull-issue
 # and certpull-pull-shell. It is installed into the lib directory because the
 # unprivileged certpull account has to be able to read it.
-LIB_FILES=( certpull-csrlib.sh )
+LIB_FILES=( certpull-csrlib.sh certpull-wwwlib.sh )
 UNITS=( certpull-renew.service certpull-renew.timer )
 
 # Keys that may be seeded automatically into an existing certpull.conf using
@@ -113,7 +113,7 @@ UNITS=( certpull-renew.service certpull-renew.timer )
 # defaults it to the same value internally, and seeding it only makes the live
 # config state explicitly what the code already does.
 SAFE_SEED=( DNS_RESOLVERS PROPAGATION_RNS PROPAGATION_WAIT PURGE_STALE_TXT
-            RENEW_DAYS DEFAULT_KEY_TYPE LOG_TAG CSR_DIR )
+            RENEW_DAYS DEFAULT_KEY_TYPE LOG_TAG CSR_DIR WWW_DIR WWW_BASE_URL )
 
 install_scripts() {
   local f
@@ -131,6 +131,30 @@ install_scripts() {
     run install -m 0644 "$SRC/$f" "/usr/local/lib/certpull/$f"
   done
   printf '   installed: %s %s %s\n' "${SBIN_SCRIPTS[*]}" "${LIB_SCRIPTS[*]}" "${LIB_FILES[*]}"
+}
+
+install_www_dir() {
+  # Only created when HTTPS publishing is actually configured. The web server
+  # has to be able to read it, and everything in it is public by definition.
+  local u d
+  u=$( set +u
+       WWW_BASE_URL=""
+       # shellcheck source=/dev/null
+       source "$CONF_LIVE" >/dev/null 2>&1 || true
+       printf '%s' "${WWW_BASE_URL:-}" )
+  if [[ -z $u ]]; then
+    printf '   WWW_BASE_URL is not set -- HTTPS publishing stays off\n'
+    return 0
+  fi
+  d=$( set +u
+       WWW_DIR=""
+       # shellcheck source=/dev/null
+       source "$CONF_LIVE" >/dev/null 2>&1 || true
+       printf '%s' "${WWW_DIR:-/var/lib/certpull/www}" )
+  run install -d -m 0755 -o root -g root "$d"
+  printf '   publishing public bundles into %s, served at %s\n' "$d" "$u"
+  printf '   NOT configuring a web server for you -- see nginx-certpull.conf.example\n'
+  printf '   or apache-certpull.conf.example and wire it up yourself.\n'
 }
 
 install_csr_dir() {
@@ -203,6 +227,8 @@ if [[ $MODE == update ]]; then
   check_config_keys
   say "CSR mode"
   install_csr_dir
+  say "HTTPS publishing"
+  install_www_dir
   cat <<EOF
 
 ============================================================================
@@ -288,6 +314,7 @@ chmod 0600 /var/lib/certpull/.ssh/authorized_keys
 say "scripts"
 install_scripts
 install_csr_dir
+install_www_dir
 
 # --- TSIG -------------------------------------------------------------------
 say "TSIG key"

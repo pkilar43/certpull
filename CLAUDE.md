@@ -20,6 +20,10 @@ The short version:
   cannot substitute it. In CSR mode the same rule covers the **names**: the
   CSR's name set must exactly equal the host's `DOMAINS`, checked by the one
   implementation in `server/certpull-csrlib.sh`.
+- Only a CSR-mode host is ever published over HTTPS, and only an explicit list
+  of files — never a glob. A full-mode bundle contains `privkey.pem`, and that
+  endpoint is anonymous. The HTTPS endpoint is read-only: the moment it accepts
+  input it needs a credential, and the reason it needs none collapses.
 - Run `./tests/run-tests.sh` before and after any change (it needs no ACME
   server and no DNS). On a live machine use `certpull-verify`. Never test
   against production ACME.

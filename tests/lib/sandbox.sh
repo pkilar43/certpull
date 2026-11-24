@@ -147,6 +147,37 @@ chmod +x "$T/bin/ssh"
 
 printf 'a-full c-csr\n' > "$T/agent/allowed"
 
+# ------------------------------------------------------------- curl stub ----
+# Stands in for the web server in front of WWW_DIR: maps the URL path onto the
+# published tree, supports -I (the agent's "is a private key being served?"
+# probe) and -o, and fails like curl -f does on a missing file.
+cat > "$T/bin/curl" <<CURLSTUB
+#!/usr/bin/env bash
+set -uo pipefail
+head_only=0; out=""; url=""
+while (( \$# )); do
+  case "\$1" in
+    -I|--head) head_only=1; shift ;;
+    -o) out="\$2"; shift 2 ;;
+    -fsS|-fsSL|--proto|--tlsv1.2|--max-time|--connect-timeout|--retry|--retry-delay)
+        case "\$1" in --proto|--max-time|--connect-timeout|--retry|--retry-delay) shift 2 ;; *) shift ;; esac ;;
+    https://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[[ -n \$url ]] || exit 2
+rel="\${url#https://stub/certs/}"
+[[ \$rel != "\$url" ]] || exit 6              # unknown host, like curl's 6
+f="$T/var/lib/certpull/www/\$rel"
+if [[ -f \$f ]]; then
+  if (( head_only )); then exit 0; fi
+  if [[ -n \$out ]]; then cat "\$f" > "\$out"; else cat "\$f"; fi
+  exit 0
+fi
+exit 22                                        # curl -f on a 404
+CURLSTUB
+chmod +x "$T/bin/curl"
+
 # ------------------------------------------------------------ server config --
 cat > "$T/etc/certpull/certpull.conf" <<EOF
 ACME_EMAIL="pki@example.com"

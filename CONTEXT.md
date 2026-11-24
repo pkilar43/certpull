@@ -59,13 +59,11 @@ Alternatives considered and **rejected** while designing it:
   (`ssh-keygen -Y sign`) beside it. In the CSR model there is nothing to
   encrypt, so both disappear. Worth revisiting **only** if `full` mode ever has
   to survive an untrusted channel.
-* **Moving the transport to HTTPS** — orthogonal, and not done here. The real
-  argument for it is environmental, not cryptographic: outbound port 22 is
-  blocked on many corporate and hospital LANs where an explicit HTTP proxy on
-  443 is the only way out. If that day comes, the thing to do is extract the
-  transport (the bundle format becomes the contract, SSH and HTTPS become two
-  ways to move it) rather than grow a second trust model. The invariant to keep
-  is the one below: the client must not be able to name the resource it fetches.
+* **Moving the transport to HTTPS** — later **built**, as a second transport
+  rather than a replacement; see section 2a. The argument for it was
+  environmental, not cryptographic: outbound port 22 is blocked on many
+  corporate and hospital LANs where an explicit HTTP proxy on 443 is the only
+  way out.
 * **`submit` triggering issuance synchronously** — tempting for the first
   certificate, but it hands a client the ability to make the server start ACME
   orders on demand, which is a rate-limit denial of service. The CSR is stored
@@ -75,6 +73,44 @@ Alternatives considered and **rejected** while designing it:
   existing key is what a 45-day certificate wants; rotation is an explicit
   `certpull-agent --rotate-key`. The pending-key machinery exists anyway,
   because the first key of a new host is in exactly that state.
+
+## 2a. The HTTPS transport, and why it carries no credentials
+
+Added once CSR mode existed, because CSR mode is what makes it possible: such a
+bundle contains no private key, and a certificate is public data — already in
+Certificate Transparency. So the endpoint is anonymous, read-only static files.
+
+The agent accepts a download only when it chains to Let's Encrypt **and**
+matches the private key that never left that machine. Neither condition says
+anything about where the bytes came from, which is why the transport needs no
+credential: whoever controls the server, the network or the proxy can refuse to
+serve a certificate (a denial of service, caught by watching expiry dates) but
+cannot produce one an agent will install, and finds no key material on the
+server's disk because for a CSR-mode host there is none.
+
+Decisions inside it, with the alternatives that were **rejected**:
+
+* **mTLS or a bearer token on the endpoint** — the obvious instinct, and wrong
+  here. Both add a credential to manage, an expiry to forget and a secret to
+  leak, in order to protect data that is already public. If you ever feel the
+  urge, check first what it would actually be protecting.
+* **Accepting the CSR over HTTPS too** — rejected, and this is the limit that
+  keeps the rest simple. A write needs an authenticated writer, which is the
+  whole problem the transport avoids. Enrolment is therefore one manual step
+  per key: `certpull-agent --print-csr` here, `certpull-host csr-import`
+  there. It happens once, not per renewal.
+* **Guessable paths (`/certs/<hostid>/`)** — rejected. The certificates are
+  public, but *which internal host serves which customer's names* is not
+  something to hand out to anyone who can guess a hostid. Hence the 128-bit
+  `WWW_TOKEN` in the path. **The token is not a password and nothing may be
+  built on it being one** — it only prevents enumeration. A leak is an
+  information-disclosure annoyance, not a breach.
+* **Letting the installer configure nginx** — rejected, and this one has a
+  scar: see the ufw row in section 5. An installer that takes over a machine's
+  web server breaks the machine. It ships example vhosts and creates `WWW_DIR`;
+  wiring it up is the operator's.
+* **Publishing full-mode hosts too** — never. Their bundles contain
+  `privkey.pem`. This is guarded three times over, see invariant 13.
 
 ### Knot DNS + lego (not acme-dns, not BIND + certbot)
 
@@ -179,6 +215,25 @@ zone we fully control. No automation on the client zones' side at all.
     one from `lego`'s store when a host moves into the mode; the agent refuses a
     bundle that contains one, and refuses a certificate that does not match its
     local key.
+
+---
+
+13. **Only a CSR-mode host is ever published over HTTPS, and only an explicit
+    list of files.** A full-mode bundle contains `privkey.pem`, and serving it
+    from an anonymous endpoint would hand the private key to the internet.
+    Guarded in three places, deliberately redundant because the cost of being
+    wrong is unrecoverable: `www_publish` returns early unless the mode is
+    `csr`; it refuses outright if anything key-shaped is in the source
+    directory; and it copies `CERTPULL_WWW_FILES` by name rather than globbing,
+    so a stray file cannot ride along. On the other side every agent probes the
+    endpoint for a private key on **every** run and aborts loudly, which turns
+    the fleet into a detector for the mistake; `certpull-host doctor` checks it
+    too. Never replace that file list with a glob, and never add a
+    "publish anyway" option.
+
+14. **The HTTPS endpoint is read-only.** No verb, no upload, no form. The
+    moment something there accepts input it needs an authenticated writer, and
+    the entire argument for the transport having no credentials collapses.
 
 ---
 
@@ -302,6 +357,7 @@ like something other than what it actually was.
 | A wildcard host getting a certificate covering fewer names than configured, or `lego` refusing to run at all with "Please specify --domains" | Our own bug, and it predated CSR mode: `for d in $DOMAINS` is subject to **pathname expansion**, and the scripts run with `shopt -s nullglob`, so `*.lan.example.com` matched no file and vanished from the list. A mixed list quietly lost its wildcard; a pure-wildcard host had no `--domains` left at all. Fixed by `read -r -a` everywhere (`certpull-issue`, `certpull-host cname`, `certpull-verify`, the agent's CSR builder and its `checkhost` loop). |
 | A host switched to `CSR_MODE="yes"` carrying on exactly as before, private key still published | Our own bug: no renewal was due and the fingerprint had not changed, so nothing was re-issued and nothing was re-published. The published **mode** and the published **domain list** are now part of the re-issue decision. The same hole made adding a name to `DOMAINS` a no-op until the natural renewal weeks later. |
 | An agent in a loop: a new key generated on every run, a CSR sent for it, and the certificate signed for the previous one never accepted | Our own bug: the "switched from full to csr, generate a fresh key" condition stayed true until a matching certificate was *installed*, so each run threw away the pending key the server was in the middle of signing. Fixed by never generating a second pending key while one exists (`--rotate-key` is the deliberate exception). |
+| An agent not noticing that the HTTPS endpoint was serving a private key | Our own bug, found by the test suite: the probe for `privkey.pem` ran only on the install path, so an agent whose certificate did not match (a rotation in flight, say) would never look. Every agent now probes on every run — the point being that a leak is an emergency whether or not this particular agent wanted that certificate today. |
 | Apache on the same machine stopping dead on port 443 right after `install-server.sh` ran | Our own bug, and the worst kind: the installer ran `ufw allow 22,53` and then `ufw --force enable`, so **every other port on the box was closed**. Nothing in the output mentioned it — the symptom was "the website stopped working", several steps away from the cause. It now reads `ss -tlnH`/`ss -ulnH` first and opens whatever is already listening, never re-enables an already active ufw, warns by name about enabled-but-stopped services whose ports it could not detect, and takes `--no-ufw`. `--show-firewall-plan` prints the decision without root and without changing anything. |
 | An agent happily serving a certificate that no longer covered the configured names after `DOMAINS` changed on the server | Nothing locally revealed it: key and certificate were a perfectly matching pair, just for the wrong name set. The server now reports `csr_state=ok\|stale\|missing` through the `config` verb, using the same `csr_check` that guards `submit`, and the agent resubmits on `stale`. |
 
@@ -358,9 +414,11 @@ that.
 * **45-day Let's Encrypt certificates** — hence `RENEW_DAYS=15` (about one
   third of the lifetime). If the lifetime shortens further, scale that down
   proportionally.
-* **An HTTPS transport** — see section 2 for why it is not here and what the
-  motivation would be (outbound 22 blocked, 443 through a proxy being the only
-  way out). Extract the transport first; do not grow a second trust model.
+* **Dropping the SSH transport entirely** — tempting once most of the fleet is
+  on HTTPS, but SSH is still the only one that can accept a CSR without a human
+  in the loop. Removing it would make every key rotation a manual step.
+  Anything that replaces it has to solve authenticated *write* without adding a
+  credential to the frequent path.
 * **Making `csr` the default** — plausible once enough of the fleet runs an
   agent that knows `submit`. It is not the default today purely for
   compatibility: an older agent fails closed against a CSR-mode host, which is

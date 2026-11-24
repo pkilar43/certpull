@@ -32,6 +32,7 @@ source "$CONF"
 : "${RENEW_DAYS:=15}" "${DEFAULT_KEY_TYPE:=ec256}" "${DNS_PORT:=53}"
 : "${PROPAGATION_WAIT:=0}" "${LOG_TAG:=certpull}"
 : "${CSR_DIR:=/var/lib/certpull/csr}"
+: "${WWW_DIR:=/var/lib/certpull/www}" "${WWW_BASE_URL:=}"
 
 # The CSR checks live in a library shared with certpull-pull-shell, so the
 # authorisation rule has exactly one implementation. See certpull-csrlib.sh.
@@ -42,6 +43,13 @@ for _lib in "$LIBDIR/certpull-csrlib.sh" /usr/local/lib/certpull/certpull-csrlib
   fi
 done
 [[ -n ${CSRLIB:-} ]] || { echo "certpull-csrlib.sh not found (run install-server.sh --update)" >&2; exit 1; }
+for _lib in "$LIBDIR/certpull-wwwlib.sh" /usr/local/lib/certpull/certpull-wwwlib.sh; do
+  if [[ -r $_lib ]]; then
+    # shellcheck source=certpull-wwwlib.sh
+    source "$_lib"; WWWLIB="$_lib"; break
+  fi
+done
+[[ -n ${WWWLIB:-} ]] || { echo "certpull-wwwlib.sh not found (run install-server.sh --update)" >&2; exit 1; }
 
 GLOBAL_RENEW_DAYS="$RENEW_DAYS"
 GLOBAL_KEY_TYPE="$DEFAULT_KEY_TYPE"
@@ -99,6 +107,7 @@ unset LEGO_DISABLE_CNAME_SUPPORT 2>/dev/null || true
 RESOLVER1="${DNS_RESOLVERS%%,*}"; RESOLVER1="${RESOLVER1%%:*}"
 
 mkdir -p "$LEGO_DIR" "$PULL_DIR" "$CSR_DIR"
+if www_enabled; then mkdir -p "$WWW_DIR"; chmod 0755 "$WWW_DIR"; fi
 chmod 0700 "$LEGO_DIR"
 chmod 0711 "$PULL_DIR"
 # CSR_DIR is written by certpull-pull-shell as the unprivileged certpull
@@ -331,6 +340,15 @@ process_host() {
   crt="$LEGO_DIR/certificates/$stem.crt"
   left=$(days_left "$crt")
 
+  # The HTTPS config.json goes out before anything else is decided: an agent
+  # that has nothing published yet reads its domains from there, and after a
+  # DOMAINS change it needs the new list in order to produce the CSR that
+  # unblocks the issuance. Writing it at publish time would deadlock that.
+  if [[ $mode == csr ]] && www_enabled; then
+    www_write_config "$hostid" "$DOMAINS" "$mode" "$key_type" \
+      || fail "$hostid: could not write the HTTPS config.json"
+  fi
+
   # --- CSR mode: the agent must have submitted a CSR first -------------------
   # Skipped for --preflight, which only exercises the DNS delegation and must
   # keep working before any agent has ever run.
@@ -499,6 +517,20 @@ process_host() {
       shred -u "$LEGO_DIR/certificates/$stem.key" 2>/dev/null \
         || rm -f "$LEGO_DIR/certificates/$stem.key"
       log "$hostid: removed the old server-side private key left over from full mode"
+    fi
+
+    # Mirror the public part onto the HTTPS endpoint. Only reached for csr
+    # mode; www_publish refuses anything else and refuses a source directory
+    # that contains a private key, because the cost of being wrong here is
+    # publishing that key to the internet.
+    if www_enabled && [[ $mode == csr ]]; then
+      if www_publish "$hostid" "$PULL_DIR/$hostid" "$mode"; then
+        log "$hostid: also published over HTTPS at $(www_url "$hostid")"
+      else
+        fail "$hostid: HTTPS publishing failed -- agents using TRANSPORT=https will keep the old certificate"
+        notify "$hostid" "https publish failed"
+        return 1
+      fi
     fi
   fi
   return 0

@@ -21,6 +21,13 @@
 #                          The host must also be in CSR mode on the server:
 #                            certpull-host add --csr <hostid> <domains...>
 #
+# --https <url>            fetch over anonymous HTTPS instead of SSH. Implies
+#                          --csr, needs no SSH key and no outbound port 22, so
+#                          it works behind an HTTP-proxy-only egress. Get the
+#                          url from `certpull-host url <hostid>` on the server.
+#                            ./install-agent.sh --https https://ns-certpull.example.com/certs/srv-web-01-ab12... srv-web-01
+# --proxy <url>            an explicit outbound proxy for --https
+#
 # Update after changes in the repository -- replaces ONLY the script and the
 # units; it does not touch the configuration, the SSH key or known_hosts:
 #   ./install-agent.sh --update
@@ -38,14 +45,17 @@ DEFAULT_SERVER="${CERTPULL_DEFAULT_SERVER:-certpull@ns-certpull.example.com}"
 [[ $EUID -eq 0 ]] || { echo "run as root (the agent itself will later run as an ordinary user)" >&2; exit 1; }
 
 AGENT_USER=""; RELOAD_UNIT=""; MODE=install; DRY=0; WANT_CSR=0
+CERT_URL=""; PROXY_URL=""; TRANSPORT="ssh"
 while [[ ${1:-} == --* ]]; do
   case "$1" in
     --user)        AGENT_USER="${2:?}"; shift 2 ;;
     --reload-unit) RELOAD_UNIT="${2:?}"; shift 2 ;;
     --csr)         WANT_CSR=1; shift ;;
+    --https)       CERT_URL="${2:?}"; TRANSPORT="https"; WANT_CSR=1; shift 2 ;;
+    --proxy)       PROXY_URL="${2:?}"; shift 2 ;;
     --update)      MODE=update; shift ;;
     --dry-run)     DRY=1; shift ;;
-    -h|--help)     sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,37p' "$0"; exit 0 ;;
     *)             echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,7 +69,8 @@ run() { if (( DRY )); then printf '   [dry-run] %s\n' "$*"; else "$@"; fi; }
 # "follow the server" -- seeding it changes nothing about how an existing agent
 # behaves, it only makes the option visible in the file.
 AGENT_SAFE_SEED=( FILE_STYLE DEST_MODE CERT_MODE KEY_MODE COMBINED EXPECT_DOMAINS
-                  SERVER_PORT CERT_OWNER KEY_OWNER CSR_MODE AGENT_KEY_TYPE )
+                  SERVER_PORT CERT_OWNER KEY_OWNER CSR_MODE AGENT_KEY_TYPE
+                  TRANSPORT PROXY )
 
 check_agent_conf() {          # $1 = config file  $2 = template
   local live="$1" tpl="$2" key line missing_safe=() missing_manual=()
@@ -159,16 +170,25 @@ say "packages"
 # We do not call apt-get blindly: on a host with stale package lists it can
 # fail even though every tool we need is already present, taking the whole
 # installation down with it. So we first check what is actually missing.
+needed=( openssl tar )
+if [[ $TRANSPORT == https ]]; then
+  # No SSH at all in this mode -- that is the whole point of it.
+  needed+=( curl )
+else
+  needed+=( ssh-keygen ssh-keyscan )
+fi
 missing=()
-for c in ssh-keygen ssh-keyscan openssl tar; do
+for c in "${needed[@]}"; do
   command -v "$c" >/dev/null || missing+=( "$c" )
 done
 if ((${#missing[@]} == 0)); then
-  echo "   ssh-keygen, ssh-keyscan, openssl, tar -- all present"
+  echo "   ${needed[*]} -- all present"
 elif command -v apt-get >/dev/null; then
   echo "   missing: ${missing[*]} -- installing"
+  pkgs=( openssl tar )
+  if [[ $TRANSPORT == https ]]; then pkgs+=( curl ca-certificates ); else pkgs+=( openssh-client ); fi
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    openssh-client openssl tar >/dev/null || true
+    "${pkgs[@]}" >/dev/null || true
   still=()
   for c in "${missing[@]}"; do command -v "$c" >/dev/null || still+=( "$c" ); done
   if ((${#still[@]})); then
@@ -221,6 +241,18 @@ else
 fi
 # ============================================================================
 
+if [[ $TRANSPORT == https ]]; then
+# ---------------------------------------------------------- https transport --
+# No SSH key and no host-key pinning: this transport authenticates nothing and
+# needs nothing, because the bundle it downloads is verified against the
+# private key that stays on this machine.
+say "transport: anonymous HTTPS"
+echo "   $CERT_URL"
+echo "   no SSH key is created and port 22 is not used at all"
+if ! command -v curl >/dev/null; then
+  echo "curl is missing and could not be installed" >&2; exit 1
+fi
+else
 say "SSH key"
 if [[ ! -s $KEY ]]; then
   "${RUNAS[@]}" ssh-keygen -q -t ed25519 -N '' -f "$KEY" \
@@ -260,6 +292,7 @@ EOF
   ssh-keygen -lf "$KNOWN" || echo "  (cannot print the fingerprints -- check $KNOWN by hand)"
   echo "On the server:  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
 fi
+fi   # transport
 
 say "configuration"
 # NOTE: every pattern below must match a line that really exists in
@@ -268,10 +301,14 @@ say "configuration"
 # -- that exact mistake once shipped an installer that ignored its arguments.
 if [[ ! -s $CONF ]]; then
   CSR_VALUE=""; if (( WANT_CSR )); then CSR_VALUE="yes"; fi
+  # NOTE: | is the sed delimiter, and CERT_URL contains / but never | .
   sed -e "s|^SERVER=.*|SERVER=\"$SERVER\"|" \
       -e "s|^SERVER_PORT=.*|SERVER_PORT=\"$PORT\"|" \
       -e "s|^HOSTID=.*|HOSTID=\"$HOSTID\"|" \
       -e "s|^CSR_MODE=.*|CSR_MODE=\"$CSR_VALUE\"|" \
+      -e "s|^TRANSPORT=.*|TRANSPORT=\"$TRANSPORT\"|" \
+      -e "s|^CERT_URL=.*|CERT_URL=\"$CERT_URL\"|" \
+      -e "s|^PROXY=.*|PROXY=\"$PROXY_URL\"|" \
       "$TEMPLATE" > "$CONF"
   chmod 0640 "$CONF"
   if [[ $AGENT_USER != root ]]; then chown "$AGENT_USER:$AGENT_USER" "$CONF"; fi
@@ -279,6 +316,11 @@ if [[ ! -s $CONF ]]; then
 elif (( WANT_CSR )); then
   echo "   $CONF already exists -- not touched."
   echo "   For CSR mode set there:  CSR_MODE=\"yes\""
+  if [[ $TRANSPORT == https ]]; then
+    echo "   and for the HTTPS transport:"
+    echo "       TRANSPORT=\"https\""
+    echo "       CERT_URL=\"$CERT_URL\""
+  fi
 fi
 
 if [[ -n $RELOAD_UNIT && $AGENT_USER != root ]]; then
@@ -309,24 +351,42 @@ cat <<EOF
  Agent installed  (user: $AGENT_USER)
 
    config        $CONF
-   key           $KEY
+   key           $( [[ $TRANSPORT == https ]] && echo "(none -- anonymous HTTPS)" || echo "$KEY" )
    certificates  $( [[ $AGENT_USER == root ]] && echo /etc/ssl/certpull || echo "$UHOME/certificates" )
    timer         ${UNIT}.timer
 
  On the SERVER run:
 
    certpull-host add $( ((WANT_CSR)) && printf -- '--csr ' )$HOSTID <domain> [more domains...]
-   certpull-host key $HOSTID "$(cat "$KEY.pub")"
+$( if [[ $TRANSPORT == https ]]; then
+     printf '   # no agent key to authorise: this host fetches anonymously\n'
+   else
+     printf '   certpull-host key %s "%s"\n' "$HOSTID" "$(cat "$KEY.pub")"
+   fi )
 
- Several certificates on this host -- the hostid list overwrites the previous one:
-   certpull-host key $HOSTID,<other-hostid> "$(cat "$KEY.pub")"
- and here, use profiles instead of agent.conf:
+ Several certificates on this host -- one profile per certificate:
    $(dirname "$CONF")/agent.d/*.conf
+$( if [[ $TRANSPORT != https ]]; then
+     printf ' and one authorisation covering both hostids (the list overwrites the previous one):\n'
+     printf '   certpull-host key %s,<other-hostid> "%s"\n' "$HOSTID" "$(cat "$KEY.pub")"
+   else
+     printf ' each profile gets its own CERT_URL from: certpull-host url <hostid>\n'
+   fi )
 
  Then back here:
    $( [[ $AGENT_USER == root ]] && echo "certpull-agent --check" || echo "runuser -u $AGENT_USER -- certpull-agent --check" )
    systemctl list-timers ${UNIT}.timer
-$( if ((WANT_CSR)); then cat <<CSREOF
+$( if [[ $TRANSPORT == https ]]; then cat <<CSREOF
+
+ HTTPS transport: the endpoint is read-only, so enrolment is a one-time manual
+ step. Here:
+   $( [[ $AGENT_USER == root ]] && echo "certpull-agent --print-csr > /tmp/$HOSTID.csr" || echo "runuser -u $AGENT_USER -- certpull-agent --print-csr > /tmp/$HOSTID.csr" )
+ copy that one file to the server, then there:
+   certpull-host csr-import $HOSTID /tmp/$HOSTID.csr
+   certpull-issue $HOSTID
+ After that this host renews itself over HTTPS with no credentials at all.
+CSREOF
+elif ((WANT_CSR)); then cat <<CSREOF
 
  CSR mode: this machine generates its own key and sends only a CSR, so the
  first certificate needs one extra step. Here:

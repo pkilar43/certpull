@@ -1,0 +1,71 @@
+# Apache: serve the PUBLIC part of certpull's certificates over HTTPS.
+#
+# -> /etc/apache2/sites-available/certpull.conf   (then a2ensite certpull)
+# Needs: a2enmod ssl headers
+#
+# This endpoint serves public data and therefore has NO authentication. It
+# hands out a certificate chain plus a meta.json -- never a private key,
+# because only CSR-mode hosts are published here and their bundles have none.
+# An agent accepts a download only if it chains to Let's Encrypt AND matches
+# the private key that never left that machine.
+#
+# install-server.sh deliberately does NOT write or enable this for you.
+#
+# The TLS certificate below can be one certpull issues for itself:
+#     certpull-host add certpull-self ns-certpull.example.com
+#     certpull-issue certpull-self
+
+<VirtualHost *:443>
+    ServerName ns-certpull.example.com
+
+    SSLEngine on
+    SSLCertificateFile    /var/lib/certpull/pull/certpull-self/fullchain.pem
+    SSLCertificateKeyFile /var/lib/certpull/pull/certpull-self/privkey.pem
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+
+    DocumentRoot /var/www/empty
+    ErrorLog  ${APACHE_LOG_DIR}/certpull-error.log
+    CustomLog ${APACHE_LOG_DIR}/certpull-access.log combined
+
+    Alias /certs /var/lib/certpull/www
+
+    <Directory /var/lib/certpull/www>
+        Require all granted
+
+        # No listing: the path is "<hostid>-<token>" and the token exists so
+        # that the fleet cannot be enumerated. Indexes would give it away.
+        Options -Indexes -FollowSymLinks -Includes -ExecCGI
+        AllowOverride None
+
+        # Read-only.
+        <LimitExcept GET HEAD>
+            Require all denied
+        </LimitExcept>
+
+        # .pem and SHA256SUMS have no type of their own; plain text suits both
+        # curl and a browser.
+        DefaultType text/plain
+        AddType text/plain .pem
+        AddType application/json .json
+
+        # Agents poll twice a day, so a few minutes is plenty and a renewal
+        # still reaches the fleet quickly.
+        <IfModule mod_headers.c>
+            Header always set Cache-Control "public, max-age=300"
+            Header always set X-Content-Type-Options "nosniff"
+        </IfModule>
+    </Directory>
+
+    # Nothing else on this vhost.
+    <Location />
+        Require all denied
+    </Location>
+    <Location /certs>
+        Require all granted
+    </Location>
+</VirtualHost>
+
+<VirtualHost *:80>
+    ServerName ns-certpull.example.com
+    Redirect permanent / https://ns-certpull.example.com/
+</VirtualHost>

@@ -1,0 +1,81 @@
+# nginx: serve the PUBLIC part of certpull's certificates over HTTPS.
+#
+# -> /etc/nginx/sites-available/certpull   (then ln -s into sites-enabled)
+#
+# This endpoint serves public data and therefore has NO authentication. What it
+# hands out is a certificate chain plus a meta.json -- never a private key,
+# because only CSR-mode hosts are published here and their bundles have none.
+# An agent accepts what it downloads only if it chains to Let's Encrypt AND
+# matches the private key that never left that machine, so neither this server
+# nor the network in between has to be trusted for the result to be correct.
+#
+# install-server.sh deliberately does NOT write or enable this for you: taking
+# over a machine's web server is how an installer breaks the machine.
+#
+# The TLS certificate below can be one certpull issues for itself. Add a host
+# for this very server and point the agent-less paths at its pull directory:
+#     certpull-host add certpull-self ns-certpull.example.com
+#     certpull-issue certpull-self
+# There is no circularity -- DNS-01 does not depend on this vhost existing.
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ns-certpull.example.com;
+
+    ssl_certificate     /var/lib/certpull/pull/certpull-self/fullchain.pem;
+    ssl_certificate_key /var/lib/certpull/pull/certpull-self/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/certpull-access.log;
+    error_log  /var/log/nginx/certpull-error.log;
+
+    # Nothing here is dynamic and nothing accepts input.
+    location / {
+        return 404;
+    }
+
+    location /certs/ {
+        alias /var/lib/certpull/www/;
+
+        # No listing: the path component after /certs/ is "<hostid>-<token>",
+        # and the token exists precisely so that the fleet cannot be
+        # enumerated. autoindex would hand the whole list over for free.
+        autoindex off;
+
+        # Read-only. Anything that is not a plain GET or HEAD is a mistake.
+        limit_except GET HEAD { deny all; }
+
+        # Do not follow a symlink out of the tree, whatever ends up in there.
+        disable_symlinks on from=$document_root;
+
+        # .pem and SHA256SUMS have no useful type of their own; serving them as
+        # plain text keeps curl and a browser both happy.
+        default_type text/plain;
+        charset utf-8;
+        types {
+            application/json json;
+        }
+
+        # Certificates change every few weeks and agents poll twice a day, so a
+        # few minutes of caching is plenty and keeps a renewal from taking
+        # hours to reach the fleet.
+        add_header Cache-Control "public, max-age=300" always;
+        add_header X-Content-Type-Options "nosniff" always;
+
+        # An agent that asks for something that is not there has the wrong
+        # token or the wrong hostid; let it say so plainly.
+        error_page 403 =404 /404;
+    }
+
+    location = /404 { internal; return 404; }
+}
+
+# Redirect plain HTTP, but keep it to a redirect: nothing is served over 80.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ns-certpull.example.com;
+    return 301 https://$host$request_uri;
+}
