@@ -34,14 +34,22 @@ run() { if (( DRY )); then printf '   [dry-run] %s\n' "$*"; else "$@"; fi; }
 # --- server scripts: one source of truth for both modes ---------------------
 SBIN_SCRIPTS=( certpull-issue certpull-status certpull-host certpull-zone certpull-verify )
 LIB_SCRIPTS=( certpull-pull-shell )
+# Sourced, not executed: the CSR authorisation rule shared by certpull-issue
+# and certpull-pull-shell. It is installed into the lib directory because the
+# unprivileged certpull account has to be able to read it.
+LIB_FILES=( certpull-csrlib.sh )
 UNITS=( certpull-renew.service certpull-renew.timer )
 
 # Keys that may be seeded automatically into an existing certpull.conf using
 # the value from the template. The condition: the template value is a sensible
 # default for EVERY installation. Keys that depend on the particular deployment
 # (ACME_ZONE, ACME_NS_NAME, ACME_EMAIL, paths) are only reported.
+#
+# CSR_DIR is on this list even though it is a path: it is new, every script
+# defaults it to the same value internally, and seeding it only makes the live
+# config state explicitly what the code already does.
 SAFE_SEED=( DNS_RESOLVERS PROPAGATION_RNS PROPAGATION_WAIT PURGE_STALE_TXT
-            RENEW_DAYS DEFAULT_KEY_TYPE LOG_TAG )
+            RENEW_DAYS DEFAULT_KEY_TYPE LOG_TAG CSR_DIR )
 
 install_scripts() {
   local f
@@ -49,12 +57,29 @@ install_scripts() {
     bash -n "$SRC/$f" || { echo "$f fails bash -n -- aborting" >&2; exit 1; }
     run install -m 0755 "$SRC/$f" "/usr/local/sbin/$f"
   done
+  run install -d -m 0755 /usr/local/lib/certpull
   for f in "${LIB_SCRIPTS[@]}"; do
     bash -n "$SRC/$f" || { echo "$f fails bash -n -- aborting" >&2; exit 1; }
-    run install -d -m 0755 /usr/local/lib/certpull
     run install -m 0755 "$SRC/$f" "/usr/local/lib/certpull/$f"
   done
-  printf '   installed: %s %s\n' "${SBIN_SCRIPTS[*]}" "${LIB_SCRIPTS[*]}"
+  for f in "${LIB_FILES[@]}"; do
+    bash -n "$SRC/$f" || { echo "$f fails bash -n -- aborting" >&2; exit 1; }
+    run install -m 0644 "$SRC/$f" "/usr/local/lib/certpull/$f"
+  done
+  printf '   installed: %s %s %s\n' "${SBIN_SCRIPTS[*]}" "${LIB_SCRIPTS[*]}" "${LIB_FILES[*]}"
+}
+
+install_csr_dir() {
+  # Written by certpull-pull-shell as the certpull account (the submit verb),
+  # read by certpull-issue as root.
+  local d
+  d=$( set +u
+       CSR_DIR=""
+       # shellcheck source=/dev/null
+       source "$CONF_LIVE" >/dev/null 2>&1 || true
+       printf '%s' "${CSR_DIR:-/var/lib/certpull/csr}" )
+  run install -d -m 0700 -o certpull -g certpull "$d"
+  printf '   CSR drop directory: %s\n' "$d"
 }
 
 install_units() {
@@ -112,11 +137,17 @@ if [[ $MODE == update ]]; then
   install_units
   say "configuration"
   check_config_keys
+  say "CSR mode"
+  install_csr_dir
   cat <<EOF
 
 ============================================================================
  Scripts and units updated. NOT touched: certpull.conf (beyond seeding the
  missing keys), knot.conf, the zones, sshd, ufw, the certpull account, timers.
+
+ Existing hosts keep working exactly as before: without CSR_MODE="yes" in
+ its host file a host stays in full mode, where this server generates the
+ private key.
 
  Check that everything still works:
    certpull-host doctor
@@ -189,6 +220,7 @@ chmod 0600 /var/lib/certpull/.ssh/authorized_keys
 # --- scripts ----------------------------------------------------------------
 say "scripts"
 install_scripts
+install_csr_dir
 
 # --- TSIG -------------------------------------------------------------------
 say "TSIG key"
@@ -324,6 +356,9 @@ $( [[ -n $IP6 ]] && printf '      %s.   3600  IN  AAAA  %s\n' "$NS_NAME" "$IP6" 
       certpull-host add srv-web-01 app.example.com www.app.example.com
       # paste the CNAME records it prints into the public zone
       certpull-host key srv-web-01 "\$(cat /tmp/srv-web-01.pub)"
+
+    Or, to keep the private key on the LAN machine and only sign its CSR:
+      certpull-host add --csr srv-web-01 app.example.com www.app.example.com
 
  4) Test against staging before going to production:
       sed -i 's|acme-v02|acme-staging-v02|' /etc/certpull/certpull.conf

@@ -7,6 +7,11 @@
 #   certpull-agent --force        -> fetch and reinstall unconditionally
 #   certpull-agent --check        -> only show the state, change nothing
 #   certpull-agent --remote-list  -> ask the server what this key may fetch
+#   certpull-agent --submit       -> (CSR mode) generate the key if needed and
+#                                    send a fresh CSR, then stop
+#   certpull-agent --rotate-key   -> (CSR mode) make a NEW private key and ask
+#                                    for a certificate on it; the old key stays
+#                                    in use until the new certificate arrives
 #
 # It works in two modes, detected from the UID:
 #
@@ -19,6 +24,17 @@
 #                          target ~/certificates
 #
 # Every one of those values can be overridden in the configuration file.
+#
+# Independently of that, the SERVER decides which of two certificate modes a
+# host uses:
+#
+#   full   the server generates the private key and ships it together with the
+#          certificate. This is the original behaviour.
+#   csr    this machine generates its own private key, the key never leaves,
+#          and only a CSR goes to the server. The server publishes the
+#          certificate alone. A certificate is public data, so there is nothing
+#          to protect in transit: it is authentic because it chains to Let's
+#          Encrypt AND matches the private key sitting right here.
 set -Eeuo pipefail
 
 # --- who is running us ------------------------------------------------------
@@ -78,16 +94,26 @@ fi
 # pem    -> cert.pem chain.pem fullchain.pem privkey.pem   (default)
 # crtkey -> <hostid>.crt (full chain) + <hostid>.key + <hostid>.chain.crt
 : "${FILE_STYLE:=pem}"
+# CSR mode. Empty = whatever the server says, which is the recommended setting:
+# the server is the authority. Setting it to yes/no turns it into an assertion,
+# so a mismatch becomes an error instead of a silent change of where the
+# private key lives.
+: "${CSR_MODE:=}"
+# The key THIS machine generates for itself in CSR mode.
+# ec256 | ec384 | rsa2048 | rsa4096
+: "${AGENT_KEY_TYPE:=ec256}"
 
 LOCK="$LOCK_DIR/certpull-agent.$(basename "$CONF" .conf).lock"
 
-FORCE=0; CHECK=0; RLIST=0
+FORCE=0; CHECK=0; RLIST=0; SUBMIT_ONLY=0; ROTATE=0
 for a in "$@"; do
   case "$a" in
     --force) FORCE=1 ;;
     --check) CHECK=1 ;;
     --remote-list) RLIST=1 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    --submit) SUBMIT_ONLY=1 ;;
+    --rotate-key) ROTATE=1 ;;
+    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -110,6 +136,16 @@ else
   OUT_CERT="cert.pem"; OUT_FULL="fullchain.pem"; OUT_CHAIN="chain.pem"
   OUT_KEY="privkey.pem"; OUT_COMB="combined.pem"
 fi
+# In CSR mode the private key is generated here and lives at exactly the same
+# path as in full mode, so a service configuration does not change when a host
+# is switched between the two.
+#
+# A key that is still waiting for its first certificate -- or for a rotation to
+# complete -- is kept beside the active one and promoted ONLY once a matching
+# certificate has actually arrived. Promoting it any earlier would leave the
+# service with a key and a certificate that do not belong together.
+KEY_ACTIVE="$DEST/$OUT_KEY"
+KEY_PENDING="$DEST/.pending.$OUT_KEY"
 
 mkdir -p "$LOCK_DIR" 2>/dev/null || true
 exec 9>"$LOCK"
@@ -129,6 +165,17 @@ SSH=( ssh
 
 json() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 
+spki_of_key() {
+  [[ -s ${1:-} ]] || return 0
+  openssl pkey -in "$1" -pubout -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//'
+}
+spki_of_cert() {
+  openssl x509 -in "$1" -noout -pubkey 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//'
+}
+
 if (( RLIST )); then
   echo "hostids available to this key:"
   "${SSH[@]}" list || die "the server does not support 'list' (an old pull-shell?)"
@@ -137,13 +184,172 @@ fi
 
 [[ -r $SSH_KEY ]] || die "cannot read the key $SSH_KEY (running as $MYUSER)"
 
-# --- 1. remote fingerprint --------------------------------------------------
-META=$("${SSH[@]}" "meta $HOSTID" 2>/dev/null) \
-  || die "cannot fetch meta for $HOSTID from $SERVER (key? known_hosts? permission for this hostid?)"
-REMOTE_FP=$(printf '%s' "$META" | json fingerprint_sha256)
-REMOTE_NA=$(printf '%s' "$META" | json not_after)
-REMOTE_DOMAINS=$(printf '%s' "$META" | json domains)
-[[ -n $REMOTE_FP ]] || die "meta.json without fingerprint_sha256"
+# --- 1. what the server says ------------------------------------------------
+# "config" is asked FIRST and is the authority on the mode and the domains,
+# because it reads the host file. meta.json cannot be trusted for that: it is a
+# snapshot of the last publication, so right after a host is switched between
+# modes it still describes the old one, and an agent believing it would keep
+# running in the previous mode until the next renewal.
+#
+# config also carries the published fingerprint, so one round trip is enough --
+# the same cost as the single "meta" call this used to make.
+REMOTE_FP=""; REMOTE_NA=""; REMOTE_DOMAINS=""; REMOTE_SPKI=""; MODE=""; CSR_STATE=""
+
+ask_config() {               # (re)read mode + domains + published state
+  local out
+  if ! out=$("${SSH[@]}" "config $HOSTID" 2>/dev/null); then
+    if [[ ${CSR_MODE,,} == yes ]]; then
+      die "this server does not know the 'config' verb -- it is too old for CSR mode (run install-server.sh --update there)"
+    fi
+    return 1
+  fi
+  MODE=$(printf '%s\n' "$out" | sed -n 's/^mode=//p' | head -1)
+  REMOTE_DOMAINS=$(printf '%s\n' "$out" | sed -n 's/^domains=//p' | head -1)
+  CSR_STATE=$(printf '%s\n' "$out" | sed -n 's/^csr_state=//p' | head -1)
+  : "${MODE:=full}"
+  if [[ $(printf '%s\n' "$out" | sed -n 's/^published=//p' | head -1) == yes ]]; then
+    REMOTE_FP=$(printf '%s\n'   "$out" | sed -n 's/^fingerprint_sha256=//p' | head -1)
+    REMOTE_SPKI=$(printf '%s\n' "$out" | sed -n 's/^spki_sha256=//p'        | head -1)
+    REMOTE_NA=$(printf '%s\n'   "$out" | sed -n 's/^not_after=//p'          | head -1)
+  else
+    REMOTE_FP=""; REMOTE_SPKI=""; REMOTE_NA=""
+  fi
+  return 0
+}
+
+if ! ask_config; then
+  # An old server, which only knows "meta". Such a server can only ever be in
+  # full mode, since CSR mode did not exist there.
+  META=$("${SSH[@]}" "meta $HOSTID" 2>/dev/null) \
+    || die "cannot reach $HOSTID on $SERVER (key? known_hosts? permission for this hostid? nothing published yet?)"
+  REMOTE_FP=$(printf '%s' "$META" | json fingerprint_sha256)
+  REMOTE_NA=$(printf '%s' "$META" | json not_after)
+  REMOTE_DOMAINS=$(printf '%s' "$META" | json domains)
+  REMOTE_SPKI=$(printf '%s' "$META" | json spki_sha256)
+  MODE=$(printf '%s' "$META" | json mode)
+  : "${MODE:=full}"
+  [[ -n $REMOTE_FP ]] || die "meta.json without fingerprint_sha256"
+fi
+
+# A declared CSR_MODE is an assertion: it has to agree with the server, because
+# the two modes differ in where the private key lives.
+if [[ -n ${CSR_MODE//[[:space:]]/} ]]; then
+  WANT_MODE=full; if [[ ${CSR_MODE,,} == yes ]]; then WANT_MODE=csr; fi
+  if [[ $WANT_MODE != "$MODE" ]]; then
+    die "mode mismatch: this agent is set to '$WANT_MODE' but the server runs $HOSTID in '$MODE' (fix CSR_MODE in $CONF, or CSR_MODE in the host file on the server)"
+  fi
+fi
+
+# --- our own private key (CSR mode) -----------------------------------------
+gen_key() {                  # $1 = destination file
+  local out="$1" t="${AGENT_KEY_TYPE,,}" old_umask
+  old_umask=$(umask); umask 077
+  install -d -m "$DEST_MODE" "$DEST" 2>/dev/null || mkdir -p "$DEST"
+  case "$t" in
+    ec256)   openssl genpkey -algorithm EC  -pkeyopt ec_paramgen_curve:P-256 -out "$out.tmp" 2>/dev/null ;;
+    ec384)   openssl genpkey -algorithm EC  -pkeyopt ec_paramgen_curve:P-384 -out "$out.tmp" 2>/dev/null ;;
+    rsa2048) openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048    -out "$out.tmp" 2>/dev/null ;;
+    rsa4096) openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096    -out "$out.tmp" 2>/dev/null ;;
+    *) umask "$old_umask"; die "AGENT_KEY_TYPE=$AGENT_KEY_TYPE is not supported (ec256|ec384|rsa2048|rsa4096)" ;;
+  esac
+  umask "$old_umask"
+  [[ -s $out.tmp ]] || die "could not generate a $AGENT_KEY_TYPE private key"
+  chmod "$KEY_MODE" "$out.tmp"
+  if [[ -n $KEY_OWNER ]]; then chown "$KEY_OWNER" "$out.tmp" || true; fi
+  mv -f "$out.tmp" "$out"
+  log "$HOSTID: generated a new $AGENT_KEY_TYPE private key -- it will not leave this machine"
+}
+
+build_csr() {                # $1 = key file, $2 = output CSR; uses REMOTE_DOMAINS
+  local key="$1" out="$2" first sans d subj
+  local -a names=()
+  # REMOTE_DOMAINS arrives as "a.example.com, b.example.com".
+  # read -ra rather than an unquoted expansion: the multi-profile block above
+  # turns on nullglob, and a wildcard domain left unquoted is pathname-expanded
+  # -- under nullglob it vanishes, so the CSR would quietly ask for fewer names
+  # than the host is configured for.
+  read -r -a names <<<"${REMOTE_DOMAINS//,/ }"
+  (( ${#names[@]} )) || die "the server did not tell us any domains for $HOSTID"
+  first="${names[0]}"
+  sans=""
+  for d in "${names[@]}"; do sans+="DNS:$d,"; done
+  sans="${sans%,}"
+  # A CN is limited to 64 characters. When the first name does not fit we leave
+  # the subject empty: lego then takes the first DNS SAN as the main domain, and
+  # openssl preserves the SAN order we pass here, so it ends up being the same
+  # name -- which is what the server expects the files to be called.
+  if (( ${#first} <= 64 )); then subj="/CN=$first"; else subj="/"; fi
+  openssl req -new -key "$key" -subj "$subj" -addext "subjectAltName=$sans" -out "$out" 2>/dev/null \
+    || die "could not build a CSR for $REMOTE_DOMAINS"
+}
+
+submit_csr() {               # $1 = key file to request a certificate for
+  local key="$1" csr out
+  csr=$(mktemp "${TMPDIR:-/tmp}/certpull-csr.XXXXXX")
+  build_csr "$key" "$csr"
+  if out=$("${SSH[@]}" "submit $HOSTID" < "$csr" 2>&1); then
+    rm -f "$csr"
+    log "$HOSTID: $out"
+  else
+    rm -f "$csr"
+    die "the server rejected the CSR: $out"
+  fi
+}
+
+installed_mode() {           # the mode of what is currently in DEST, or empty
+  [[ -s $DEST/meta.json ]] || return 0
+  local m; m=$(json mode < "$DEST/meta.json")
+  printf '%s' "${m:-full}"
+}
+
+MATCH=""; WANT_KEY=""; NEED_SUBMIT=0; ACT_SPKI=""; PEN_SPKI=""
+if [[ $MODE == csr ]]; then
+  PREV_MODE="$(installed_mode)"
+
+  if (( ! CHECK )); then
+    if (( ROTATE )); then
+      gen_key "$KEY_PENDING"
+    elif [[ -s $KEY_PENDING ]]; then
+      # A pending key already exists, so leave it alone. This guard is what
+      # makes the thing converge: the conditions below stay true until a
+      # matching certificate has been installed, and without it every run
+      # would throw the previous pending key away, submit a CSR for a brand
+      # new one, and never accept the certificate signed for the last one.
+      :
+    elif [[ -n $PREV_MODE && $PREV_MODE != csr && -s $KEY_ACTIVE ]]; then
+      # Switched from full to CSR mode. The key currently on disk came FROM the
+      # server, so keeping it would defeat the whole point of the move: a copy
+      # of it has already existed somewhere else. Start a fresh one.
+      log "$HOSTID: switched from $PREV_MODE to csr mode -- the old key came from the server, generating a fresh one"
+      gen_key "$KEY_PENDING"
+    elif [[ ! -s $KEY_ACTIVE ]]; then
+      gen_key "$KEY_PENDING"
+    fi
+  fi
+
+  ACT_SPKI=$(spki_of_key "$KEY_ACTIVE")
+  PEN_SPKI=$(spki_of_key "$KEY_PENDING")
+  if [[ -n $PEN_SPKI ]]; then WANT_KEY="$KEY_PENDING"; else WANT_KEY="$KEY_ACTIVE"; fi
+
+  # Which of our keys, if any, does the published certificate belong to?
+  # Only a key we actually hold can produce an installable certificate.
+  if [[ -n $REMOTE_SPKI ]]; then
+    if   [[ -n $PEN_SPKI && $REMOTE_SPKI == "$PEN_SPKI" ]]; then MATCH="$KEY_PENDING"
+    elif [[ -n $ACT_SPKI && $REMOTE_SPKI == "$ACT_SPKI" ]]; then MATCH="$KEY_ACTIVE"
+    fi
+  fi
+
+  if [[ -z $MATCH || $REMOTE_SPKI != "$(spki_of_key "$WANT_KEY")" ]]; then NEED_SUBMIT=1; fi
+  # The server says the CSR on file no longer matches the configured DOMAINS.
+  # Nothing local would reveal that: the installed key and certificate are a
+  # perfectly matching pair, they just cover the wrong set of names now.
+  if [[ $CSR_STATE == stale || $CSR_STATE == missing ]]; then
+    if [[ $CSR_STATE == stale ]]; then
+      log "$HOSTID: the server reports the stored CSR no longer matches its DOMAINS -- sending a new one"
+    fi
+    NEED_SUBMIT=1
+  fi
+fi
 
 # --- 2. local fingerprint ---------------------------------------------------
 LOCAL_FP=""
@@ -152,110 +358,209 @@ if [[ -s $DEST/$OUT_FULL ]]; then
 fi
 
 if (( CHECK )); then
+  mode_note="$MODE"
+  if [[ $MODE == csr ]]; then mode_note="$MODE (the private key stays on this machine)"; fi
   echo "profile:   $(basename "$CONF")"
   echo "user:      $MYUSER"
   echo "host:      $HOSTID"
+  echo "mode:      $mode_note"
   echo "domains:   $REMOTE_DOMAINS"
-  echo "expires:   $REMOTE_NA"
+  echo "expires:   ${REMOTE_NA:-(nothing published)}"
   echo "directory: $DEST  (style: $FILE_STYLE -> $OUT_FULL + $OUT_KEY)"
-  echo "remote fp: $REMOTE_FP"
+  echo "remote fp: ${REMOTE_FP:-(none)}"
   echo "local fp:  ${LOCAL_FP:-(none)}"
-  if [[ $LOCAL_FP == "$REMOTE_FP" ]]; then echo "state:     up to date"; else echo "state:     NEEDS UPDATE"; fi
+  if [[ $MODE == csr ]]; then
+    if [[ -n $ACT_SPKI ]]; then echo "key:       active  $ACT_SPKI"
+    else                        echo "key:       (none yet -- the next run generates one)"; fi
+    if [[ -n $PEN_SPKI ]]; then echo "           pending $PEN_SPKI -- waiting for a certificate"; fi
+  fi
+  if   [[ -z $REMOTE_FP ]];             then echo "state:     WAITING (nothing published for this host yet)"
+  elif (( NEED_SUBMIT ));               then echo "state:     NEEDS A CSR SUBMISSION (certpull-agent --submit)"
+  elif [[ $LOCAL_FP == "$REMOTE_FP" ]]; then echo "state:     up to date"
+  else                                       echo "state:     NEEDS UPDATE"
+  fi
   exit 0
 fi
 
-if [[ $LOCAL_FP == "$REMOTE_FP" ]] && (( ! FORCE )); then
+if (( SUBMIT_ONLY )); then
+  [[ $MODE == csr ]] || die "$HOSTID is in full mode -- there is no CSR to submit"
+  # No refresh needed: MODE and REMOTE_DOMAINS already came from the host file
+  # through "config" a moment ago, which is the authoritative source.
+  if [[ ! -s ${WANT_KEY:-/nonexistent} ]]; then WANT_KEY="$KEY_PENDING"; gen_key "$KEY_PENDING"; fi
+  submit_csr "$WANT_KEY"
+  log "$HOSTID: CSR sent. The certificate appears after the server's next renewal run"
+  log "         (or straight away:  certpull-issue $HOSTID   -- on the server)"
+  exit 0
+fi
+
+# --- 3. is there anything to install? ---------------------------------------
+INSTALL=0
+if [[ -n $REMOTE_FP ]]; then
+  if [[ $MODE == csr && -z $MATCH ]]; then
+    # Published, but for a key we do not hold -- usually a rotation that has not
+    # been signed yet. Nothing to install; the submission below handles it.
+    INSTALL=0
+  elif [[ $LOCAL_FP != "$REMOTE_FP" ]] || (( FORCE )); then
+    INSTALL=1
+  fi
+fi
+
+if (( ! INSTALL && ! NEED_SUBMIT )); then
   log "$HOSTID: up to date (valid until $REMOTE_NA)"
   exit 0
 fi
 
-# --- 3. download ------------------------------------------------------------
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/certpull.XXXXXX")
-chmod 0700 "$TMP"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+do_install() {
+  local f n A B
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/certpull.XXXXXX")
+  chmod 0700 "$TMP"
+  cleanup() { rm -rf "$TMP"; }
+  trap cleanup EXIT
 
-log "$HOSTID: fetching a new certificate ($REMOTE_FP)"
-"${SSH[@]}" "fetch $HOSTID" > "$TMP/bundle.tar" || die "the download failed"
-tar -C "$TMP" -xf "$TMP/bundle.tar" || die "corrupt archive"
-rm -f "$TMP/bundle.tar"
+  log "$HOSTID: fetching a new certificate ($REMOTE_FP)"
+  "${SSH[@]}" "fetch $HOSTID" > "$TMP/bundle.tar" || die "the download failed"
+  tar -C "$TMP" -xf "$TMP/bundle.tar" || die "corrupt archive"
+  rm -f "$TMP/bundle.tar"
 
-# --- 4. verification (nothing lands in the destination before this step) -----
-( cd "$TMP" && sha256sum -c --status SHA256SUMS ) || die "checksums do not match"
+  # --- 4. verification (nothing lands in the destination before this step) ---
+  ( cd "$TMP" && sha256sum -c --status SHA256SUMS ) || die "checksums do not match"
 
-for f in cert.pem fullchain.pem privkey.pem; do
-  [[ -s $TMP/$f ]] || die "$f is missing or empty"
-done
-
-GOT_FP=$(openssl x509 -in "$TMP/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
-[[ $GOT_FP == "$REMOTE_FP" ]] || die "the fingerprint of the downloaded cert does not match meta.json"
-
-A=$(openssl x509 -in "$TMP/cert.pem" -noout -pubkey | openssl sha256)
-B=$(openssl pkey -in "$TMP/privkey.pem" -pubout | openssl sha256)
-[[ $A == "$B" ]] || die "the private key does not match the certificate"
-
-openssl x509 -in "$TMP/cert.pem" -noout -checkend 86400 >/dev/null \
-  || die "the certificate expires within 24h or has already expired -- not installing it"
-
-openssl verify -untrusted "$TMP/fullchain.pem" "$TMP/cert.pem" >/dev/null 2>&1 \
-  || log "warning: openssl verify could not confirm the chain (LE staging? a private CA?)"
-
-CHECK_NAMES="${EXPECT_DOMAINS:-${REMOTE_DOMAINS//,/ }}"
-for n in $CHECK_NAMES; do
-  openssl x509 -in "$TMP/cert.pem" -noout -checkhost "${n#\*.}" >/dev/null 2>&1 \
-    || die "the certificate does not cover the name $n"
-done
-
-# --- 5. installation --------------------------------------------------------
-install -d -m "$DEST_MODE" "$DEST" 2>/dev/null || mkdir -p "$DEST"
-[[ -w $DEST ]] || die "no write permission for $DEST (running as $MYUSER)"
-
-BACKUP="$DEST/.previous"
-rm -rf "$BACKUP"
-if [[ -s $DEST/$OUT_FULL ]]; then
-  install -d -m 0700 "$BACKUP"
-  for f in "$OUT_CERT" "$OUT_FULL" "$OUT_CHAIN" "$OUT_KEY" "$OUT_COMB"; do
-    [[ -e $DEST/$f ]] && cp -a "$DEST/$f" "$BACKUP/" || true
+  local -a need=( cert.pem fullchain.pem )
+  if [[ $MODE != csr ]]; then need+=( privkey.pem ); fi
+  for f in "${need[@]}"; do
+    [[ -s $TMP/$f ]] || die "$f is missing or empty"
   done
-fi
+  if [[ $MODE == csr && -e $TMP/privkey.pem ]]; then
+    die "the server sent a private key for a host in CSR mode -- refusing to touch it"
+  fi
 
-if [[ ${COMBINED,,} == yes ]]; then
-  cat "$TMP/fullchain.pem" "$TMP/privkey.pem" > "$TMP/combined.pem"
-fi
+  GOT_FP=$(openssl x509 -in "$TMP/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+  [[ $GOT_FP == "$REMOTE_FP" ]] || die "the fingerprint of the downloaded cert does not match meta.json"
 
-put() {                      # $1=source file in TMP  $2=target name  $3=owner  $4=mode
-  local src="$TMP/$1" dst="$DEST/$2" owner="$3" mode="$4"
-  [[ -s $src ]] || return 0
-  local -a args=( -m "$mode" )
-  if [[ -n $owner ]]; then args+=( -o "${owner%%:*}" -g "${owner##*:}" ); fi
-  install "${args[@]}" "$src" "$DEST/.new.$2"
-  mv -f "$DEST/.new.$2" "$dst"
+  if [[ $MODE == csr ]]; then
+    # THE check of this mode: the certificate must belong to the private key
+    # that never left this machine. Neither the transport nor the server has to
+    # be trusted for that to hold -- only Let's Encrypt and the local key.
+    A=$(spki_of_cert "$TMP/cert.pem")
+    B=$(spki_of_key "$MATCH")
+    [[ -n $A && $A == "$B" ]] \
+      || die "the downloaded certificate does not match the local private key -- not installing it"
+  else
+    A=$(openssl x509 -in "$TMP/cert.pem" -noout -pubkey | openssl sha256)
+    B=$(openssl pkey -in "$TMP/privkey.pem" -pubout | openssl sha256)
+    [[ $A == "$B" ]] || die "the private key does not match the certificate"
+  fi
+
+  openssl x509 -in "$TMP/cert.pem" -noout -checkend 86400 >/dev/null \
+    || die "the certificate expires within 24h or has already expired -- not installing it"
+
+  openssl verify -untrusted "$TMP/fullchain.pem" "$TMP/cert.pem" >/dev/null 2>&1 \
+    || log "warning: openssl verify could not confirm the chain (LE staging? a private CA?)"
+
+  # Same reason as above for read -ra. A wildcard name is checked against a
+  # label under it, because openssl's -checkhost does not treat the bare parent
+  # name as covered by *.parent -- and it is not.
+  local -a cnames=()
+  read -r -a cnames <<<"${EXPECT_DOMAINS:-${REMOTE_DOMAINS//,/ }}"
+  for n in "${cnames[@]}"; do
+    local probe="$n"
+    if [[ $n == \*.* ]]; then probe="certpull-wildcard-probe.${n#\*.}"; fi
+    openssl x509 -in "$TMP/cert.pem" -noout -checkhost "$probe" >/dev/null 2>&1 \
+      || die "the certificate does not cover the name $n"
+  done
+
+  # --- 5. installation ------------------------------------------------------
+  install -d -m "$DEST_MODE" "$DEST" 2>/dev/null || mkdir -p "$DEST"
+  [[ -w $DEST ]] || die "no write permission for $DEST (running as $MYUSER)"
+
+  BACKUP="$DEST/.previous"
+  rm -rf "$BACKUP"
+  if [[ -s $DEST/$OUT_FULL ]]; then
+    install -d -m 0700 "$BACKUP"
+    for f in "$OUT_CERT" "$OUT_FULL" "$OUT_CHAIN" "$OUT_KEY" "$OUT_COMB"; do
+      [[ -e $DEST/$f ]] && cp -a "$DEST/$f" "$BACKUP/" || true
+    done
+  fi
+
+  if [[ ${COMBINED,,} == yes ]]; then
+    if [[ $MODE == csr ]]; then
+      cat "$TMP/fullchain.pem" "$MATCH" > "$TMP/combined.pem"
+    else
+      cat "$TMP/fullchain.pem" "$TMP/privkey.pem" > "$TMP/combined.pem"
+    fi
+  fi
+
+  put() {                    # $1=source file in TMP  $2=target name  $3=owner  $4=mode
+    local src="$TMP/$1" dst="$DEST/$2" owner="$3" mode="$4"
+    [[ -s $src ]] || return 0
+    local -a args=( -m "$mode" )
+    if [[ -n $owner ]]; then args+=( -o "${owner%%:*}" -g "${owner##*:}" ); fi
+    install "${args[@]}" "$src" "$DEST/.new.$2"
+    mv -f "$DEST/.new.$2" "$dst"
+  }
+
+  # The key is promoted first: between it and the certificates there must be no
+  # window in which a reload could pick up a mismatched pair. Both are renames
+  # inside one directory, so each is atomic, and RELOAD_CMD only runs at the end.
+  if [[ $MODE == csr && $MATCH == "$KEY_PENDING" ]]; then
+    install -m "$KEY_MODE" "$KEY_PENDING" "$DEST/.new.$OUT_KEY"
+    if [[ -n $KEY_OWNER ]]; then chown "$KEY_OWNER" "$DEST/.new.$OUT_KEY" || true; fi
+    mv -f "$DEST/.new.$OUT_KEY" "$KEY_ACTIVE"
+    rm -f "$KEY_PENDING"
+    MATCH="$KEY_ACTIVE"
+    log "$HOSTID: the new private key is now the active one"
+  fi
+
+  put cert.pem      "$OUT_CERT"  "$CERT_OWNER" "$CERT_MODE"
+  put fullchain.pem "$OUT_FULL"  "$CERT_OWNER" "$CERT_MODE"
+  put chain.pem     "$OUT_CHAIN" "$CERT_OWNER" "$CERT_MODE"
+  if [[ $MODE != csr ]]; then
+    put privkey.pem "$OUT_KEY"   "$KEY_OWNER"  "$KEY_MODE"
+    # A key this agent had generated for a CSR-mode run is meaningless now that
+    # the server supplies one again; leaving it behind would make a later
+    # switch back to CSR mode silently reuse a key of unclear age.
+    if [[ -e $KEY_PENDING ]]; then
+      shred -u "$KEY_PENDING" 2>/dev/null || rm -f "$KEY_PENDING"
+    fi
+  fi
+  put combined.pem  "$OUT_COMB"  "$KEY_OWNER"  "$KEY_MODE"
+  put meta.json     "meta.json"  "$CERT_OWNER" "0644"
+
+  # --- 6. service reload ----------------------------------------------------
+  # With a dedicated user, RELOAD_CMD usually needs passwordless sudo, e.g.
+  #   RELOAD_CMD="sudo -n /usr/bin/systemctl reload nginx"
+  # with a rule in /etc/sudoers.d/certpull-agent restricted to that one command.
+  if [[ -n $RELOAD_CMD ]]; then
+    if bash -c "$RELOAD_CMD"; then
+      log "$HOSTID: installed into $DEST and reloaded (valid until $REMOTE_NA)"
+    else
+      log "the reload failed -- rolling back to the previous certificate"
+      if [[ -d $BACKUP ]]; then
+        cp -a "$BACKUP"/. "$DEST"/ 2>/dev/null || true
+        bash -c "$RELOAD_CMD" || log "the rollback did not reload the service either -- NEEDS ATTENTION"
+      fi
+      die "RELOAD_CMD returned an error"
+    fi
+  else
+    log "$HOSTID: installed into $DEST (valid until $REMOTE_NA), no RELOAD_CMD"
+  fi
 }
 
-put cert.pem      "$OUT_CERT"  "$CERT_OWNER" "$CERT_MODE"
-put fullchain.pem "$OUT_FULL"  "$CERT_OWNER" "$CERT_MODE"
-put chain.pem     "$OUT_CHAIN" "$CERT_OWNER" "$CERT_MODE"
-put privkey.pem   "$OUT_KEY"   "$KEY_OWNER"  "$KEY_MODE"
-put combined.pem  "$OUT_COMB"  "$KEY_OWNER"  "$KEY_MODE"
-put meta.json     "meta.json"  "$CERT_OWNER" "0644"
+# Called plainly, NOT as `do_install || ...`: that would switch off set -e for
+# the whole function body and a failing step would be reported as success.
+if (( INSTALL )); then do_install; fi
 
-# --- 6. service reload ------------------------------------------------------
-# With a dedicated user, RELOAD_CMD usually needs passwordless sudo, e.g.
-#   RELOAD_CMD="sudo -n /usr/bin/systemctl reload nginx"
-# with a rule in /etc/sudoers.d/certpull-agent restricted to that one command.
-if [[ -n $RELOAD_CMD ]]; then
-  if bash -c "$RELOAD_CMD"; then
-    log "$HOSTID: installed into $DEST and reloaded (valid until $REMOTE_NA)"
+# --- 7. ask for a certificate on the key we hold ----------------------------
+# Deliberately last: if a renewal was waiting for the key currently in use, it
+# gets installed first, and only then does the next rotation start.
+if (( NEED_SUBMIT )); then
+  if [[ ! -s ${WANT_KEY:-/nonexistent} ]]; then WANT_KEY="$KEY_PENDING"; gen_key "$KEY_PENDING"; fi
+  submit_csr "$WANT_KEY"
+  if [[ -z $REMOTE_FP ]]; then
+    log "$HOSTID: CSR sent, waiting for the first certificate"
   else
-    log "the reload failed -- rolling back to the previous certificate"
-    if [[ -d $BACKUP ]]; then
-      cp -a "$BACKUP"/. "$DEST"/ 2>/dev/null || true
-      bash -c "$RELOAD_CMD" || log "the rollback did not reload the service either -- NEEDS ATTENTION"
-    fi
-    die "RELOAD_CMD returned an error"
+    log "$HOSTID: CSR sent for the new key; the current certificate stays in use until it is signed"
   fi
-else
-  log "$HOSTID: installed into $DEST (valid until $REMOTE_NA), no RELOAD_CMD"
 fi
 
 exit 0

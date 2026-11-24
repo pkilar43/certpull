@@ -1,28 +1,56 @@
 #!/usr/bin/env bash
 # certpull-host -- host management on the server side.
 #
-#   certpull-host add <hostid> <domain> [domain...]    add a host + show CNAMEs
+#   certpull-host add [--csr] <hostid> <domain> [domain...]  add a host + show CNAMEs
 #   certpull-host cname <hostid>                       show the records to paste
 #   certpull-host key <hostid>[,<hostid>...] '<key>'   authorise an agent key
 #                                                      (reusing it overwrites the list)
 #   certpull-host del <hostid>                         remove a host (conf, key, pull)
-#   certpull-host list                                 hosts and their domains
+#   certpull-host list                                 hosts, mode and domains
 #   certpull-host keys                                 keys and what they may fetch
+#   certpull-host csr [<hostid>]                       state of the submitted CSRs
 #   certpull-host doctor                               diagnose the SSH account
+#
+# --csr puts the host in CSR mode: the agent generates its own private key and
+# submits a CSR, and this server never holds the private key. Without it the
+# server generates the key, as it always has.
 set -euo pipefail
 
 CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
+LIBDIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=/dev/null
 source "$CONF"
 : "${HOSTS_DIR:=/etc/certpull/hosts.d}" "${PULL_DIR:=/var/lib/certpull/pull}"
 : "${ACME_ZONE:?}" "${DEFAULT_KEY_TYPE:=ec256}"
+: "${CSR_DIR:=/var/lib/certpull/csr}"
 GLOBAL_ACME_ZONE="$ACME_ZONE"
 
 AUTHKEYS="/var/lib/certpull/.ssh/authorized_keys"
 SHELLBIN="/usr/local/lib/certpull/certpull-pull-shell"
 
-usage() { sed -n '3,13p' "$0"; exit 2; }
+usage() { sed -n '3,18p' "$0"; exit 2; }
 die()   { echo "certpull-host: $*" >&2; exit 1; }
+
+load_csrlib() {
+  local l
+  for l in "$LIBDIR/certpull-csrlib.sh" /usr/local/lib/certpull/certpull-csrlib.sh; do
+    if [[ -r $l ]]; then
+      # shellcheck source=certpull-csrlib.sh
+      source "$l"; return 0
+    fi
+  done
+  die "certpull-csrlib.sh not found (run install-server.sh --update)"
+}
+
+host_mode() {                # $1 = hostid -> csr|full
+  local m
+  m=$( set +u
+       CSR_MODE=""
+       # shellcheck source=/dev/null
+       source "$HOSTS_DIR/$1.conf" >/dev/null 2>&1 || true
+       printf '%s' "${CSR_MODE,,}" )
+  if [[ $m == yes ]]; then printf 'csr'; else printf 'full'; fi
+}
 
 valid_id() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "a hostid may only contain [a-z0-9._-]"; }
 
@@ -31,8 +59,14 @@ cmd="${1:-}"; shift || usage
 case "$cmd" in
 
 add)
-  zone_override=""
-  if [[ ${1:-} == --zone ]]; then zone_override="${2:-}"; shift 2; fi
+  zone_override=""; csr_mode="no"
+  while :; do
+    case "${1:-}" in
+      --zone) zone_override="${2:-}"; shift 2 ;;
+      --csr)  csr_mode="yes"; shift ;;
+      *) break ;;
+    esac
+  done
   hostid="${1:-}"; shift || usage
   valid_id "$hostid"
   (($#)) || die "give at least one domain"
@@ -46,9 +80,21 @@ ENABLED="yes"
 # The zone this host's _acme-challenge CNAME points into.
 # Empty = ACME_ZONE from /etc/certpull/certpull.conf
 ACME_ZONE="$zone_override"
+# yes = the agent generates its own private key and submits a CSR; this server
+#       signs it and never holds the private key. Requires an agent that knows
+#       the "submit" verb.
+CSR_MODE="$csr_mode"
 EOF
   chmod 0644 "$HOSTS_DIR/$hostid.conf"
-  echo "created $HOSTS_DIR/$hostid.conf"
+  echo "created $HOSTS_DIR/$hostid.conf (mode: $( [[ $csr_mode == yes ]] && echo csr || echo full ))"
+  if [[ $csr_mode == yes ]]; then
+    echo
+    echo "CSR mode: nothing will be issued until the agent submits a CSR."
+    echo "On the LAN machine, after install-agent.sh --csr:"
+    echo "    certpull-agent --submit"
+    echo "then here:"
+    echo "    certpull-issue $hostid"
+  fi
   echo
   exec "$0" cname "$hostid"
   ;;
@@ -60,15 +106,18 @@ cname)
   # shellcheck source=/dev/null
   source "$HOSTS_DIR/$hostid.conf"
   zone="${ACME_ZONE:-$GLOBAL_ACME_ZONE}"
+  # read -ra, not an unquoted expansion: a wildcard domain would otherwise be
+  # pathname-expanded against the current directory.
+  declare -a dlist=(); read -r -a dlist <<<"$DOMAINS"
   echo "Paste into the public zones (once; nothing changes afterwards):"
   echo
-  for d in $DOMAINS; do
+  for d in "${dlist[@]}"; do
     base="${d#\*.}"
     printf '  _acme-challenge.%s.\t300\tIN\tCNAME\t%s.%s.\n' "$base" "$base" "$zone"
   done
   echo
   echo "Verify once propagated:"
-  for d in $DOMAINS; do
+  for d in "${dlist[@]}"; do
     base="${d#\*.}"
     printf '  dig +short CNAME _acme-challenge.%s\n' "$base"
   done
@@ -124,6 +173,7 @@ del)
   hostid="${1:-}"; valid_id "$hostid"
   rm -f "$HOSTS_DIR/$hostid.conf"
   rm -rf "${PULL_DIR:?}/$hostid"
+  rm -f "${CSR_DIR:?}/$hostid.csr"
   # drop the hostid from the lists in authorized_keys; remove the whole line
   # only once its list becomes empty
   if [[ -s $AUTHKEYS ]]; then
@@ -150,12 +200,47 @@ del)
 list)
   shopt -s nullglob
   for f in "$HOSTS_DIR"/*.conf; do
-    hostid=$(basename "$f" .conf); DOMAINS=""; ENABLED="yes"
+    hostid=$(basename "$f" .conf); DOMAINS=""; ENABLED="yes"; CSR_MODE=""
     # shellcheck source=/dev/null
     source "$f"
     haskey=no
     if grep -qE "certpull-pull-shell [^\"]*\b${hostid//./\\.}\b" "$AUTHKEYS" 2>/dev/null; then haskey=yes; fi
-    printf '%-22s enabled=%-4s key=%-4s %s\n' "$hostid" "$ENABLED" "$haskey" "$DOMAINS"
+    mode=full; if [[ ${CSR_MODE,,} == yes ]]; then mode=csr; fi
+    csrst=""
+    if [[ $mode == csr ]]; then
+      if [[ -s $CSR_DIR/$hostid.csr ]]; then csrst=" csr=ok"; else csrst=" csr=MISSING"; fi
+    fi
+    printf '%-22s mode=%-5s enabled=%-4s key=%-4s%s %s\n' \
+      "$hostid" "$mode" "$ENABLED" "$haskey" "$csrst" "$DOMAINS"
+  done
+  ;;
+
+csr)
+  # What the agents have submitted, and whether it still matches DOMAINS.
+  load_csrlib
+  shopt -s nullglob
+  if [[ -n ${1:-} ]]; then valid_id "$1"; files=( "$HOSTS_DIR/$1.conf" ); else files=( "$HOSTS_DIR"/*.conf ); fi
+  (( ${#files[@]} )) || { echo "(no hosts)"; exit 0; }
+  for f in "${files[@]}"; do
+    [[ -r $f ]] || die "no $f"
+    hostid=$(basename "$f" .conf); DOMAINS=""; CSR_MODE=""
+    # shellcheck source=/dev/null
+    source "$f"
+    if [[ ${CSR_MODE,,} != yes ]]; then
+      printf '%-22s full mode -- the server holds the key\n' "$hostid"
+      continue
+    fi
+    c="$CSR_DIR/$hostid.csr"
+    if [[ ! -s $c ]]; then
+      printf '%-22s NO CSR YET -- run certpull-agent --submit on the LAN host\n' "$hostid"
+      continue
+    fi
+    if out=$(csr_check "$c" "$DOMAINS" 2>&1); then
+      printf '%-22s ok   spki=%s  names=%s\n' "$hostid" "$(csr_spki_sha256 "$c")" "$(csr_names "$c" | tr '\n' ' ')"
+    else
+      printf '%-22s STALE/INVALID\n' "$hostid"
+      printf '%s\n' "$out" | sed 's/^/                       /'
+    fi
   done
   ;;
 
@@ -213,6 +298,51 @@ doctor)
     ok "$PULL_DIR ($n published certificates)"
   else
     bad "$PULL_DIR is missing"
+  fi
+
+  echo "CSR mode:"
+  if [[ -r $LIBDIR/certpull-csrlib.sh || -r /usr/local/lib/certpull/certpull-csrlib.sh ]]; then
+    ok "certpull-csrlib.sh is installed"
+  else
+    bad "certpull-csrlib.sh is missing -- the submit verb cannot work"
+    echo "         fix:  ./install-server.sh --update"
+  fi
+  if [[ -d $CSR_DIR ]]; then
+    pc=$(stat -c '%a %U:%G' "$CSR_DIR")
+    if [[ $pc == "700 certpull:certpull" ]]; then
+      ok "$CSR_DIR ($pc, $(find "$CSR_DIR" -maxdepth 1 -name '*.csr' 2>/dev/null | wc -l) CSRs)"
+    else
+      bad "$CSR_DIR is $pc (expected 700 certpull:certpull)"
+      echo "         the certpull account writes submitted CSRs there"
+      echo "         fix:  ./install-server.sh --update"
+    fi
+  else
+    warn "$CSR_DIR does not exist yet -- it is created on the first run or by install-server.sh --update"
+  fi
+  # The pull-shell reads DOMAINS out of the host files as the certpull account.
+  if [[ -d $HOSTS_DIR ]]; then
+    ph=$(stat -c '%a' "$HOSTS_DIR")
+    case "$ph" in
+      *[157]) ok "$HOSTS_DIR is traversable ($ph)" ;;
+      *) bad "$HOSTS_DIR is $ph -- the certpull account cannot read DOMAINS, so CSR mode breaks"
+         echo "         fix:  chmod 0755 $HOSTS_DIR" ;;
+    esac
+  fi
+  # certpull-pull-shell runs as certpull and cannot read certpull.conf, so it
+  # falls back to its own compiled-in defaults. If the paths here have been
+  # moved, the forced command has to be told -- otherwise submit writes into a
+  # directory certpull-issue never looks at, and fetch finds nothing.
+  if [[ $PULL_DIR != /var/lib/certpull/pull ]]; then
+    warn "PULL_DIR is $PULL_DIR, but the pull shell defaults to /var/lib/certpull/pull"
+    echo "         set CERTPULL_PULL_DIR for the forced command, or keep the default"
+  fi
+  if [[ $CSR_DIR != /var/lib/certpull/csr ]]; then
+    warn "CSR_DIR is $CSR_DIR, but the pull shell defaults to /var/lib/certpull/csr"
+    echo "         set CERTPULL_CSR_DIR for the forced command, or keep the default"
+  fi
+  if [[ $HOSTS_DIR != /etc/certpull/hosts.d ]]; then
+    warn "HOSTS_DIR is $HOSTS_DIR, but the pull shell defaults to /etc/certpull/hosts.d"
+    echo "         set CERTPULL_HOSTS_DIR for the forced command, or keep the default"
   fi
 
   echo

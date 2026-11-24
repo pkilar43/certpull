@@ -52,6 +52,13 @@ lego/
 accounts/
 certificates/
 pull/
+csr/
+
+# --- test sandbox -----------------------------------------------------------
+# tests/run-tests.sh puts its sandbox under $TMPDIR by default, so nothing
+# should ever land here -- but T=./tests/sandbox is an easy thing to type when
+# debugging, and that sandbox is full of private keys.
+tests/sandbox/
 
 # --- backups made by the installers and by certpull-zone --------------------
 *.bak

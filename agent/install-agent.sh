@@ -16,6 +16,11 @@
 # --reload-unit <service>  writes a sudo rule letting that user run
 #                          ONLY `systemctl reload <service>`
 #
+# --csr                    this machine generates its own private key and only
+#                          ever sends a CSR; the server never holds the key.
+#                          The host must also be in CSR mode on the server:
+#                            certpull-host add --csr <hostid> <domains...>
+#
 # Update after changes in the repository -- replaces ONLY the script and the
 # units; it does not touch the configuration, the SSH key or known_hosts:
 #   ./install-agent.sh --update
@@ -32,14 +37,15 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_SERVER="${CERTPULL_DEFAULT_SERVER:-certpull@ns-certpull.example.com}"
 [[ $EUID -eq 0 ]] || { echo "run as root (the agent itself will later run as an ordinary user)" >&2; exit 1; }
 
-AGENT_USER=""; RELOAD_UNIT=""; MODE=install; DRY=0
+AGENT_USER=""; RELOAD_UNIT=""; MODE=install; DRY=0; WANT_CSR=0
 while [[ ${1:-} == --* ]]; do
   case "$1" in
     --user)        AGENT_USER="${2:?}"; shift 2 ;;
     --reload-unit) RELOAD_UNIT="${2:?}"; shift 2 ;;
+    --csr)         WANT_CSR=1; shift ;;
     --update)      MODE=update; shift ;;
     --dry-run)     DRY=1; shift ;;
-    -h|--help)     sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,28p' "$0"; exit 0 ;;
     *)             echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -48,8 +54,12 @@ run() { if (( DRY )); then printf '   [dry-run] %s\n' "$*"; else "$@"; fi; }
 
 # Keys that may be seeded into an existing agent.conf from the template.
 # HOSTID, SERVER, DEST and RELOAD_CMD are host-specific -- only reported.
+#
+# CSR_MODE is on this list because its template value is empty, which means
+# "follow the server" -- seeding it changes nothing about how an existing agent
+# behaves, it only makes the option visible in the file.
 AGENT_SAFE_SEED=( FILE_STYLE DEST_MODE CERT_MODE KEY_MODE COMBINED EXPECT_DOMAINS
-                  SERVER_PORT CERT_OWNER KEY_OWNER )
+                  SERVER_PORT CERT_OWNER KEY_OWNER CSR_MODE AGENT_KEY_TYPE )
 
 check_agent_conf() {          # $1 = config file  $2 = template
   local live="$1" tpl="$2" key line missing_safe=() missing_manual=()
@@ -252,14 +262,23 @@ EOF
 fi
 
 say "configuration"
+# NOTE: every pattern below must match a line that really exists in
+# agent.conf.example / agent.conf.user.example. A renamed or reworded key makes
+# sed match nothing SILENTLY, and the generated config keeps the template value
+# -- that exact mistake once shipped an installer that ignored its arguments.
 if [[ ! -s $CONF ]]; then
+  CSR_VALUE=""; if (( WANT_CSR )); then CSR_VALUE="yes"; fi
   sed -e "s|^SERVER=.*|SERVER=\"$SERVER\"|" \
       -e "s|^SERVER_PORT=.*|SERVER_PORT=\"$PORT\"|" \
       -e "s|^HOSTID=.*|HOSTID=\"$HOSTID\"|" \
+      -e "s|^CSR_MODE=.*|CSR_MODE=\"$CSR_VALUE\"|" \
       "$TEMPLATE" > "$CONF"
   chmod 0640 "$CONF"
   if [[ $AGENT_USER != root ]]; then chown "$AGENT_USER:$AGENT_USER" "$CONF"; fi
   echo "created $CONF"
+elif (( WANT_CSR )); then
+  echo "   $CONF already exists -- not touched."
+  echo "   For CSR mode set there:  CSR_MODE=\"yes\""
 fi
 
 if [[ -n $RELOAD_UNIT && $AGENT_USER != root ]]; then
@@ -296,7 +315,7 @@ cat <<EOF
 
  On the SERVER run:
 
-   certpull-host add $HOSTID <domain> [more domains...]
+   certpull-host add $( ((WANT_CSR)) && printf -- '--csr ' )$HOSTID <domain> [more domains...]
    certpull-host key $HOSTID "$(cat "$KEY.pub")"
 
  Several certificates on this host -- the hostid list overwrites the previous one:
@@ -307,5 +326,15 @@ cat <<EOF
  Then back here:
    $( [[ $AGENT_USER == root ]] && echo "certpull-agent --check" || echo "runuser -u $AGENT_USER -- certpull-agent --check" )
    systemctl list-timers ${UNIT}.timer
+$( if ((WANT_CSR)); then cat <<CSREOF
+
+ CSR mode: this machine generates its own key and sends only a CSR, so the
+ first certificate needs one extra step. Here:
+   $( [[ $AGENT_USER == root ]] && echo "certpull-agent --submit" || echo "runuser -u $AGENT_USER -- certpull-agent --submit" )
+ and then on the server:
+   certpull-issue $HOSTID
+ After that the timers take over on both sides.
+CSREOF
+fi )
 ============================================================================
 EOF

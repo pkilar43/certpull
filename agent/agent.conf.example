@@ -35,6 +35,23 @@ COMBINED="no"
 # names. Empty = check only what came in meta.json from the server.
 EXPECT_DOMAINS=""
 
+# --- Which side holds the private key ---------------------------------------
+# Empty (recommended) = follow the server: it is the authority on whether this
+#   host is in "full" or "csr" mode, and the agent adapts.
+# "yes" / "no" turn this into an ASSERTION. A mismatch with the server then
+#   becomes an error instead of a silent change of where the private key lives.
+#
+# csr mode means: this machine generates its own private key, the key never
+# goes anywhere, and only a CSR is sent to the server. The first certificate
+# needs one extra step -- `certpull-agent --submit` here, then
+# `certpull-issue <hostid>` on the server -- after which the timers take over.
+CSR_MODE=""
+
+# The key this machine generates for itself in csr mode (ignored in full mode,
+# where KEY_TYPE in the host file on the server decides).
+# ec256 | ec384 | rsa2048 | rsa4096
+AGENT_KEY_TYPE="ec256"
+
 # Command to reload the service after the certificate is replaced.
 # Several commands may be chained with ';'. If it returns an error, the agent
 # rolls the replacement back.

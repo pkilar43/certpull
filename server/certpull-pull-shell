@@ -11,9 +11,22 @@
 # If it omits the hostid, the first one on the list is used (backwards
 # compatibility). A requested hostid MUST be on the list from the forced
 # command -- a client cannot reach for somebody else's certificate.
+#
+# Verbs:
+#   list                 the hostids this key may use
+#   ping   [hostid]      liveness check
+#   config [hostid]      mode, domains and key type -- what the agent needs
+#                        BEFORE anything has been published (CSR mode)
+#   meta   [hostid]      meta.json of the published certificate
+#   sums   [hostid]      SHA256SUMS of the published certificate
+#   fetch  [hostid]      tar stream of the published bundle
+#   submit [hostid]      read a CSR on stdin and store it (CSR mode only)
 set -euo pipefail
 
+LIBDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PULL_DIR="${CERTPULL_PULL_DIR:-/var/lib/certpull/pull}"
+HOSTS_DIR="${CERTPULL_HOSTS_DIR:-/etc/certpull/hosts.d}"
+CSR_DIR="${CERTPULL_CSR_DIR:-/var/lib/certpull/csr}"
 
 deny() { echo "certpull: $*" >&2; exit 1; }
 
@@ -45,27 +58,146 @@ for h in "${ALLOWED[@]}"; do if [[ $h == "$HOSTID" ]]; then ok=1; fi; done
 (( ok )) || deny "this key has no access to $HOSTID (allowed: ${ALLOWED[*]})"
 
 DIR="$PULL_DIR/$HOSTID"
-[[ -d $DIR ]] || deny "no published certificate for $HOSTID"
 
 logger -t certpull-pull -- "host=$HOSTID verb=$VERB from=${PEER:-local}" 2>/dev/null || true
+
+# --- the host's server-side configuration -----------------------------------
+# Sourced in a subshell so a host file cannot leak variables into this script.
+# The files are root-owned and 0644; the certpull account can read them but not
+# write them, which is what makes DOMAINS trustworthy here.
+host_conf() {                # $1 = key -> value, or empty
+  local key="$1" f="$HOSTS_DIR/$HOSTID.conf"
+  [[ -r $f ]] || return 0
+  ( set +u
+    DOMAINS=""; CSR_MODE=""; KEY_TYPE=""; ENABLED=""
+    # shellcheck source=/dev/null
+    source "$f" >/dev/null 2>&1 || exit 0
+    case "$key" in
+      DOMAINS)  printf '%s' "$DOMAINS" ;;
+      CSR_MODE) printf '%s' "$CSR_MODE" ;;
+      KEY_TYPE) printf '%s' "$KEY_TYPE" ;;
+      ENABLED)  printf '%s' "$ENABLED" ;;
+    esac )
+}
+
+is_csr_mode() {
+  local m; m="$(host_conf CSR_MODE)"
+  [[ ${m,,} == yes ]]
+}
+
+# Verbs that read a published certificate need the directory to exist. config,
+# submit and ping must work BEFORE anything has been published -- that is the
+# whole bootstrap path of CSR mode.
+need_published() {
+  [[ -d $DIR ]] || deny "no published certificate for $HOSTID"
+}
 
 case "$VERB" in
   ping)
     echo "pong $HOSTID"
     ;;
+
+  config)
+    # Everything the agent needs in one round trip, taken from the only
+    # authoritative source there is -- the host file, not the last publication.
+    #
+    # The mode MUST come from here rather than from meta.json: meta.json is a
+    # snapshot of whatever was published last, so right after a host is
+    # switched between modes it still describes the old one. An agent trusting
+    # it would keep running in the previous mode until the next renewal.
+    #
+    # The published state is appended so a new agent needs no second call.
+    if is_csr_mode; then printf 'mode=csr\n'; else printf 'mode=full\n'; fi
+    printf 'domains=%s\n' "$(host_conf DOMAINS)"
+    printf 'key_type=%s\n' "$(host_conf KEY_TYPE)"
+    printf 'hostid=%s\n' "$HOSTID"
+    # Whether the CSR on file is still usable is decided HERE, by the same
+    # function that guards submit, and not by the agent re-deriving the policy.
+    # It is what tells an agent that DOMAINS changed on the server: its key and
+    # its certificate are still a matching pair, so nothing else would hint
+    # that the certificate no longer covers the configured names.
+    if is_csr_mode; then
+      cdom="$(host_conf DOMAINS)"
+      if [[ ! -s $CSR_DIR/$HOSTID.csr ]]; then
+        printf 'csr_state=missing\n'
+      else
+        # shellcheck source=certpull-csrlib.sh
+        source "$LIBDIR/certpull-csrlib.sh"
+        if csr_check "$CSR_DIR/$HOSTID.csr" "$cdom" >/dev/null 2>&1; then
+          printf 'csr_state=ok\n'
+        else
+          printf 'csr_state=stale\n'
+        fi
+      fi
+    fi
+    if [[ -s $DIR/meta.json ]]; then
+      m=$(cat "$DIR/meta.json")
+      jget() { printf '%s' "$m" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+      printf 'published=yes\n'
+      printf 'fingerprint_sha256=%s\n' "$(jget fingerprint_sha256)"
+      printf 'spki_sha256=%s\n' "$(jget spki_sha256)"
+      printf 'not_after=%s\n' "$(jget not_after)"
+      printf 'published_mode=%s\n' "$(jget mode)"
+    else
+      printf 'published=no\n'
+    fi
+    ;;
+
   meta)
+    need_published
     cat "$DIR/meta.json"
     ;;
+
   sums)
+    need_published
     cat "$DIR/SHA256SUMS"
     ;;
+
   fetch)
-    # tar stream on stdout; the agent unpacks it into a temporary directory
-    tar -C "$DIR" -cf - \
-        --owner=0 --group=0 --mode=0600 \
-        cert.pem chain.pem fullchain.pem privkey.pem meta.json SHA256SUMS
+    need_published
+    # The file list is built from what is actually there: in CSR mode there is
+    # no privkey.pem, because the server never had the private key. A fixed list
+    # would make tar fail and the agent report a corrupt archive.
+    files=()
+    for f in cert.pem chain.pem fullchain.pem privkey.pem meta.json SHA256SUMS; do
+      if [[ -e $DIR/$f ]]; then files+=( "$f" ); fi
+    done
+    (( ${#files[@]} )) || deny "the published directory for $HOSTID is empty"
+    tar -C "$DIR" -cf - --owner=0 --group=0 --mode=0600 "${files[@]}"
     ;;
+
+  submit)
+    # CSR mode: the agent keeps its private key and sends only a CSR.
+    is_csr_mode || deny "$HOSTID is not in CSR mode (set CSR_MODE=\"yes\" in $HOSTS_DIR/$HOSTID.conf)"
+
+    domains="$(host_conf DOMAINS)"
+    [[ -n $domains ]] || deny "$HOSTID has no DOMAINS configured on the server"
+
+    # shellcheck source=certpull-csrlib.sh
+    source "$LIBDIR/certpull-csrlib.sh"
+
+    mkdir -p "$CSR_DIR" 2>/dev/null || true
+    [[ -w $CSR_DIR ]] || deny "$CSR_DIR is not writable by $(id -un) -- run install-server.sh --update"
+
+    tmp="$CSR_DIR/.incoming.$HOSTID.$$"
+    trap 'rm -f "$tmp"' EXIT
+    # Bounded read: anything longer than the cap is truncated and will then fail
+    # to parse, so an agent cannot fill the disk through this verb.
+    head -c "$CERTPULL_CSR_MAX_BYTES" > "$tmp" || true
+
+    if ! csr_check "$tmp" "$domains"; then
+      deny "the CSR was rejected (see above)"
+    fi
+
+    install -m 0600 "$tmp" "$CSR_DIR/.staged.$HOSTID" \
+      || deny "cannot write into $CSR_DIR"
+    mv -f "$CSR_DIR/.staged.$HOSTID" "$CSR_DIR/$HOSTID.csr"
+
+    echo "accepted CSR for $HOSTID ($(csr_spki_sha256 "$CSR_DIR/$HOSTID.csr"))"
+    logger -t certpull-pull -- "host=$HOSTID csr accepted spki=$(csr_spki_sha256 "$CSR_DIR/$HOSTID.csr")" 2>/dev/null || true
+    ;;
+
   *)
-    deny "command not allowed: $VERB (allowed: list ping meta sums fetch)"
+    deny "command not allowed: $VERB (allowed: list ping config meta sums fetch submit)"
     ;;
 esac

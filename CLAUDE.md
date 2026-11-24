@@ -17,8 +17,15 @@ The short version:
 - Nothing lands in the agent's destination directory before the full set of
   verification steps has passed.
 - The `hostid` in the forced command is written on the server side — a client
-  cannot substitute it.
-- Test with `certpull-verify` and stubs, never against production ACME.
+  cannot substitute it. In CSR mode the same rule covers the **names**: the
+  CSR's name set must exactly equal the host's `DOMAINS`, checked by the one
+  implementation in `server/certpull-csrlib.sh`.
+- Run `./tests/run-tests.sh` before and after any change (it needs no ACME
+  server and no DNS). On a live machine use `certpull-verify`. Never test
+  against production ACME.
 - `set -Eeuo pipefail` everywhere: `(( x )) && cmd` kills the script when `x`
   is zero — use `if`. And a function called as `f || rc=1` has `set -e`
   disabled throughout its body, so catch failures explicitly.
+- Never split a domain list by leaving it unquoted: these scripts run with
+  `nullglob`, so a wildcard domain is pathname-expanded and silently
+  disappears. Use `read -r -a`.

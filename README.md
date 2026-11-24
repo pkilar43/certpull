@@ -21,6 +21,7 @@ nothing has to be forwarded through NAT or opened on the edge firewall.
 | We do not want the PKI server to SSH into the LAN | Reversed direction: the agent in the LAN connects out and pulls its own certificate |
 | An agent key may leak | `restrict` + forced command, a whitelist of verbs, and each key sees only its own `hostid` |
 | A tampered or corrupt transfer | `SHA256SUMS`, key/certificate match, `checkend`, `checkhost`, and rollback if the reload fails |
+| A private key should not exist in two places | CSR mode: the agent generates its own key, sends only a CSR, and the server never holds the key |
 
 ---
 
@@ -502,40 +503,164 @@ the first two words are taken and checked against a whitelist:
 |---|---|
 | `list` | print the `hostid`s this key is entitled to |
 | `ping [hostid]` | `pong <hostid>` — connectivity test |
-| `meta [hostid]` | `meta.json`: domains, serial, `not_after`, `fingerprint_sha256` |
+| `config [hostid]` | mode, domains, key type, and the published fingerprint/SPKI — everything the agent needs in one round trip |
+| `meta [hostid]` | `meta.json`: domains, mode, serial, `not_after`, `fingerprint_sha256`, `spki_sha256` |
 | `sums [hostid]` | `SHA256SUMS` |
-| `fetch [hostid]` | a `tar` stream with six files |
+| `fetch [hostid]` | a `tar` stream of the published files |
+| `submit [hostid]` | read a CSR on stdin and store it — CSR mode only |
 
-In every cycle the agent first asks for `meta` (a few hundred bytes) and only
-downloads the rest when the fingerprint differs from the locally installed one.
-At 40 hosts × 24 times a day that is still negligible traffic.
+In every cycle the agent asks `config` once (a few hundred bytes) and only
+downloads the rest when the published fingerprint differs from the locally
+installed one. At 40 hosts × 24 times a day that is still negligible traffic.
+
+`config` rather than `meta` is what the agent believes about the mode and the
+domains, and that distinction matters: `meta.json` describes the **last
+publication**, so immediately after a host is switched between modes it still
+describes the old one. `config` reads the host file, which is the authority.
 
 Verification on the agent side, before installing:
 
 1. `sha256sum -c SHA256SUMS`
-2. fingerprint of the downloaded `cert.pem` == fingerprint from `meta.json`
-3. public key from the certificate == public key derived from `privkey.pem`
+2. fingerprint of the downloaded `cert.pem` == fingerprint from the server
+3. the certificate's public key matches the private key — in full mode the one
+   from the bundle, in CSR mode **the one that never left this machine**
 4. `openssl x509 -checkend 86400` — we do not install something about to expire
-5. `openssl x509 -checkhost` for every expected name
+5. `openssl x509 -checkhost` for every expected name (a wildcard is probed with
+   a label underneath it, because `*.example.com` genuinely does not cover
+   `example.com`)
 6. atomic install (`.new.*` → `mv`), previous version kept in `$DEST/.previous`
 7. `RELOAD_CMD`; if it returns an error → **rollback** to the previous certificate
 
+In CSR mode a bundle containing a `privkey.pem` is refused outright, and so is
+a certificate that does not match the local key. Neither the transport nor the
+server has to be trusted for the result to be correct — only Let's Encrypt and
+the key on the local disk.
+
 ---
 
-## The private-key model
+## Who holds the private key: two modes
 
-The key is generated on the certpull server and travels to the host inside the
-SSH session. The consequences worth knowing:
+Each host chooses, on the server, in its own `hosts.d/<hostid>.conf`:
 
-* the server is a single point of compromise for all ~40 keys — treat it as a
-  PKI host: its own project, a firewall, no other services, and
-  `/var/lib/certpull` readable by root only
-* back up `/var/lib/certpull/lego` (ACME account + certificates) and
-  `/etc/certpull` — without them, recovery means reissuing everything
-* if some host requires "the key never leaves this machine", a CSR mode can be
-  added: the agent sends `csr` instead of `fetch`, the server feeds it to
-  `lego --csr` and returns only the certificate. The structure of `pull-shell`
-  is prepared for this (one more verb on the whitelist).
+```bash
+CSR_MODE="no"    # default: the server generates the key and ships it
+CSR_MODE="yes"   # the agent generates its own key and sends only a CSR
+```
+
+| | `full` (default) | `csr` |
+|---|---|---|
+| Who generates the private key | the server | the LAN machine |
+| Does the key travel | yes, inside the SSH session | **never** |
+| What is published in `pull/` | certificate **+ `privkey.pem`** | certificate only |
+| Blast radius if the server is compromised | every host's key | no key at all |
+| Which key type applies | `KEY_TYPE` on the server | `AGENT_KEY_TYPE` on the agent |
+| Steps to the first certificate | one | two (submit, then issue) |
+| Works with an agent older than this feature | yes | no — it fails closed |
+
+### Why CSR mode is worth the extra step
+
+A certificate is public data. Its authenticity does not rest on the channel it
+arrived through: it is genuine because it chains to Let's Encrypt **and**
+matches a private key that only ever existed on the machine using it. An
+attacker who owns the certpull server, or the network in between, can refuse to
+serve a certificate — but cannot produce one the agent will install, and gains
+no key material from the server's disk, because there is none.
+
+In `full` mode the server is a single point of compromise for every key in the
+fleet. That is a perfectly reasonable trade for a fleet you own end to end, and
+it is why it remains the default; but it is the thing CSR mode removes.
+
+### Setting a host up in CSR mode
+
+On the server:
+
+```bash
+certpull-host add --csr srv-web-01 app.example.com www.app.example.com
+# paste the CNAME records it prints into the public zone
+certpull-host key srv-web-01 "$(cat /tmp/srv-web-01.pub)"
+```
+
+On the LAN machine:
+
+```bash
+./install-agent.sh --csr srv-web-01
+certpull-agent --submit          # generates the key, sends the CSR
+```
+
+Back on the server:
+
+```bash
+certpull-issue srv-web-01        # signs it; or just wait for the timer
+```
+
+After that both timers take over and nothing further is manual. Until a CSR
+arrives, `certpull-issue` reports the host as *waiting* and — deliberately —
+**does not fail the run**: adding one CSR-mode host must not turn the renewal
+timer red for the whole fleet.
+
+```
+$ certpull-status
+HOST                   MODE  STATE    DAYS   PUBLISHED  DOMAINS
+srv-web-01             csr   NOCSR    -      none       app.example.com www.app.example.com
+```
+
+### Switching an existing host over
+
+Set `CSR_MODE="yes"` in its host file and run `certpull-issue <hostid>`. Two
+things then happen by themselves:
+
+* the server notices the mode changed and **re-issues immediately** rather than
+  waiting weeks for the natural renewal, so it stops serving a bundle that
+  contains a private key, and deletes the leftover key from `lego`'s store
+* the agent notices that the key currently on its disk *came from the server*
+  and generates a fresh one — keeping the old one would defeat the purpose,
+  since a copy of it has already existed elsewhere
+
+Throughout that, the service keeps the certificate and key it already had. The
+new key is promoted only once a certificate matching it has actually been
+installed; there is no window in which a reload could pick up a mismatched pair.
+
+### Rotating the key
+
+```bash
+certpull-agent --rotate-key
+```
+
+Generates a new key beside the active one, submits a CSR for it, and leaves the
+running service untouched. The next server-side run signs it, and the following
+agent run installs the certificate and promotes the key in one step. Running it
+repeatedly before the certificate arrives is harmless — the same CSR is simply
+resubmitted, which also means a server that lost its copy heals by itself.
+
+There is no automatic rotation. Renewal keeps the existing key, which is the
+behaviour a 45-day certificate wants; rotate when you have a reason to.
+
+### What stops an agent from asking for someone else's domain
+
+With `--csr`, lego takes the names to validate **from the CSR** and refuses
+`--domains` entirely. So the CSR's name set is the thing that has to be
+authorised, and it is checked against the host's `DOMAINS` — exactly equal,
+not a subset, not a superset — in `server/certpull-csrlib.sh`, by one
+implementation shared between `certpull-pull-shell` (at submit time, so the
+agent gets a usable error) and `certpull-issue` (again before calling the CA,
+because it does not trust a file on disk and `DOMAINS` may have changed since).
+
+A host that needs a different name gets it by having `DOMAINS` changed on the
+server — the same rule the `hostid` has always followed.
+
+Change `DOMAINS` and everything converges on its own: the server marks the
+stored CSR stale and refuses to use it, `config` tells the agent so, the agent
+submits a CSR for the new set, and the next run issues it.
+
+### Backups
+
+In `full` mode, back up `/var/lib/certpull/lego` and `/etc/certpull` — without
+them, recovery means reissuing everything.
+
+In CSR mode there is nothing on the server worth backing up for a given host
+beyond its configuration: the key lives on the LAN machine and belongs in
+**that** machine's backup. Lose it and the host generates a new one and asks
+for a new certificate, which is a minute's work and not a recovery procedure.
 
 ---
 
@@ -597,11 +722,12 @@ server/
   certpull.conf.example      → /etc/certpull/certpull.conf
   hosts.d/example.conf       → /etc/certpull/hosts.d/<hostid>.conf
   certpull-issue             → /usr/local/sbin/          (renewal + publishing)
-  certpull-host              → /usr/local/sbin/          (add/key/cname/del/list/keys/doctor)
+  certpull-host              → /usr/local/sbin/          (add/key/cname/del/list/keys/csr/doctor)
   certpull-zone              → /usr/local/sbin/          (add/list/show/del/soa-min)
   certpull-verify            → /usr/local/sbin/          (end-to-end delegation test)
   certpull-status            → /usr/local/sbin/
   certpull-pull-shell        → /usr/local/lib/certpull/  (forced command)
+  certpull-csrlib.sh         → /usr/local/lib/certpull/  (CSR authorisation, sourced by both)
   knot.conf.example          → /etc/knot/knot.conf
   acme-zone.example          → /var/lib/knot/<zone>.zone
   systemd/certpull-renew.{service,timer}
@@ -808,3 +934,54 @@ succeeded on the server yet.
 
 **Let's Encrypt rate limits** — 5 identical sets of names per week. Test
 against staging; use `--force` on production sparingly.
+
+### CSR mode
+
+**`CSR mode, waiting for the agent to submit a CSR`** — expected until the
+agent has run once. It is not a failure and does not affect the run's exit
+status. To get it over with now:
+
+```bash
+# on the LAN machine
+certpull-agent --submit
+# on the server
+certpull-issue <hostid>
+```
+
+**`the names in the CSR are not the ones authorised for this host`** — someone
+changed `DOMAINS` after the agent submitted its CSR. The server tells the agent
+through `config`, so the next agent run fixes it by itself; `certpull-agent
+--submit` does it immediately. `certpull-host csr` shows the state of every
+stored CSR:
+
+```
+$ certpull-host csr
+srv-web-01             ok   spki=3f0c…  names=app.example.com www.app.example.com
+srv-mail-01            STALE/INVALID
+                       the names in the CSR are not the ones authorised for this host
+                         authorised: mail.example.com smtp.example.com
+                         in the CSR: mail.example.com
+```
+
+**`this server does not know the 'config' verb`** — the server is older than
+CSR mode. Run `./install-server.sh --update` there.
+
+**`privkey.pem is missing or empty`** on the agent — the opposite case: the
+host is in CSR mode on the server but this machine still runs an agent from
+before the feature. Update it with `./install-agent.sh --update`. Note that it
+failed *closed*: nothing was installed.
+
+**`the downloaded certificate does not match the local private key`** — the
+server published a certificate belonging to a different key. In normal
+operation this is a rotation that has not been signed yet and resolves itself
+on the next run. If it persists, compare the two:
+
+```bash
+certpull-agent --check                  # on the LAN machine: active/pending SPKI
+certpull-host csr <hostid>              # on the server: the SPKI it has a CSR for
+```
+
+**`$CSR_DIR is not writable`** — the drop directory is missing or has the wrong
+owner; it belongs to the `certpull` account because the forced command writes
+there. `certpull-host doctor` checks it, and `./install-server.sh --update`
+fixes it.

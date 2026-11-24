@@ -9,10 +9,19 @@
 #   certpull-issue --dry-run        -> show what it would do
 #   certpull-issue --preflight      -> only check the DNS delegation, skip lego
 #   certpull-issue --skip-preflight -> skip the DNS check (not recommended)
+#
+# Two per-host modes, selected by CSR_MODE in the host's file:
+#
+#   full (default)  the server generates the private key, issues the
+#                   certificate and publishes key + certificate
+#   csr             the agent generates its own private key and submits a CSR;
+#                   the server signs it and publishes the certificate ONLY.
+#                   The private key never exists on this machine.
 set -Eeuo pipefail
 
 CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
 LOCK="/run/lock/certpull-issue.lock"
+LIBDIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 
 [[ -r $CONF ]] || { echo "$CONF is missing" >&2; exit 1; }
 # shellcheck source=/dev/null
@@ -22,6 +31,17 @@ source "$CONF"
 : "${TSIG_FILE:?}" "${HOSTS_DIR:?}" "${LEGO_DIR:?}" "${PULL_DIR:?}"
 : "${RENEW_DAYS:=15}" "${DEFAULT_KEY_TYPE:=ec256}" "${DNS_PORT:=53}"
 : "${PROPAGATION_WAIT:=0}" "${LOG_TAG:=certpull}"
+: "${CSR_DIR:=/var/lib/certpull/csr}"
+
+# The CSR checks live in a library shared with certpull-pull-shell, so the
+# authorisation rule has exactly one implementation. See certpull-csrlib.sh.
+for _lib in "$LIBDIR/certpull-csrlib.sh" /usr/local/lib/certpull/certpull-csrlib.sh; do
+  if [[ -r $_lib ]]; then
+    # shellcheck source=certpull-csrlib.sh
+    source "$_lib"; CSRLIB="$_lib"; break
+  fi
+done
+[[ -n ${CSRLIB:-} ]] || { echo "certpull-csrlib.sh not found (run install-server.sh --update)" >&2; exit 1; }
 
 GLOBAL_RENEW_DAYS="$RENEW_DAYS"
 GLOBAL_KEY_TYPE="$DEFAULT_KEY_TYPE"
@@ -78,9 +98,13 @@ unset LEGO_DISABLE_CNAME_SUPPORT 2>/dev/null || true
 : "${DNS_RESOLVERS:=8.8.8.8:53,9.9.9.9:53}"
 RESOLVER1="${DNS_RESOLVERS%%,*}"; RESOLVER1="${RESOLVER1%%:*}"
 
-mkdir -p "$LEGO_DIR" "$PULL_DIR"
+mkdir -p "$LEGO_DIR" "$PULL_DIR" "$CSR_DIR"
 chmod 0700 "$LEGO_DIR"
 chmod 0711 "$PULL_DIR"
+# CSR_DIR is written by certpull-pull-shell as the unprivileged certpull
+# account and only read here, so it belongs to that account.
+if id -u certpull >/dev/null 2>&1; then chown certpull:certpull "$CSR_DIR"; fi
+chmod 0700 "$CSR_DIR"
 
 # --- helpers ----------------------------------------------------------------
 lego_file_stem() {           # first domain -> the file name lego uses
@@ -191,20 +215,26 @@ days_left() {                # $1 = path to .crt ; prints the number of days (ma
   echo $(( (end - now) / 86400 ))
 }
 
-publish() {                  # $1=hostid  $2=stem  $3=domains (for meta)
-  local hostid="$1" stem="$2" domains="$3"
+publish() {                  # $1=hostid  $2=stem  $3=domains  $4=mode(full|csr)  $5=csr file (csr mode)
+  local hostid="$1" stem="$2" domains="$3" mode="${4:-full}" csr="${5:-}"
   local src="$LEGO_DIR/certificates"
-  local dst="$PULL_DIR/$hostid" tmp a b fp notafter serial
+  local dst="$PULL_DIR/$hostid" tmp a b fp notafter serial spki
+  local -a parts=()
 
-  if [[ ! -s $src/$stem.crt || ! -s $src/$stem.key ]]; then
-    fail "$hostid: $src/$stem.{crt,key} is missing"; return 1
+  if [[ ! -s $src/$stem.crt ]]; then
+    fail "$hostid: $src/$stem.crt is missing"; return 1
+  fi
+  # In CSR mode lego writes no .key at all -- certs_storage.go skips it with
+  # "if we were given a CSR, we don't know the private key". Its absence is the
+  # expected state here, not an error.
+  if [[ $mode != csr && ! -s $src/$stem.key ]]; then
+    fail "$hostid: $src/$stem.key is missing"; return 1
   fi
 
   tmp=$(mktemp -d "$PULL_DIR/.$hostid.XXXXXX")
 
   # lego writes the full chain (leaf + issuer) into .crt
   cp "$src/$stem.crt" "$tmp/fullchain.pem"
-  cp "$src/$stem.key" "$tmp/privkey.pem"
   if [[ -s $src/$stem.issuer.crt ]]; then
     cp "$src/$stem.issuer.crt" "$tmp/chain.pem"
   else
@@ -212,21 +242,40 @@ publish() {                  # $1=hostid  $2=stem  $3=domains (for meta)
   fi
   openssl x509 -in "$tmp/fullchain.pem" -out "$tmp/cert.pem"
 
-  # sanity check: the private key matches the certificate
-  a=$(openssl x509 -in "$tmp/cert.pem" -noout -pubkey | openssl sha256)
-  b=$(openssl pkey -in "$tmp/privkey.pem" -pubout | openssl sha256)
-  if [[ $a != "$b" ]]; then
-    rm -rf "$tmp"; fail "$hostid: the key does not match the certificate"; return 1
+  if [[ $mode == csr ]]; then
+    # The published certificate must belong to the key the agent kept. If this
+    # ever fails, something handed us a certificate for a different key and the
+    # agent would reject it anyway -- catch it here, where we can say why.
+    a=$(cert_spki_sha256 "$tmp/cert.pem")
+    b=$(csr_spki_sha256 "$csr")
+    if [[ -z $a || $a != "$b" ]]; then
+      rm -rf "$tmp"
+      fail "$hostid: the issued certificate does not match the submitted CSR's public key"
+      return 1
+    fi
+    parts=( cert.pem chain.pem fullchain.pem meta.json )
+  else
+    cp "$src/$stem.key" "$tmp/privkey.pem"
+    # sanity check: the private key matches the certificate
+    a=$(openssl x509 -in "$tmp/cert.pem" -noout -pubkey | openssl sha256)
+    b=$(openssl pkey -in "$tmp/privkey.pem" -pubout | openssl sha256)
+    if [[ $a != "$b" ]]; then
+      rm -rf "$tmp"; fail "$hostid: the key does not match the certificate"; return 1
+    fi
+    parts=( cert.pem chain.pem fullchain.pem privkey.pem meta.json )
   fi
 
   fp=$(openssl x509 -in "$tmp/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
   notafter=$(openssl x509 -in "$tmp/cert.pem" -noout -enddate | cut -d= -f2-)
   serial=$(openssl x509 -in "$tmp/cert.pem" -noout -serial | cut -d= -f2)
+  spki=$(cert_spki_sha256 "$tmp/cert.pem")
 
-  printf '{"hostid":"%s","domains":"%s","serial":"%s","not_after":"%s","fingerprint_sha256":"%s","published":"%s"}\n' \
-    "$hostid" "$domains" "$serial" "$notafter" "$fp" "$(date -u +%FT%TZ)" > "$tmp/meta.json"
+  # "mode" and "spki_sha256" are additions. Older agents ignore unknown fields,
+  # and a missing "mode" means "full" -- that is how an old server reads too.
+  printf '{"hostid":"%s","domains":"%s","mode":"%s","serial":"%s","not_after":"%s","fingerprint_sha256":"%s","spki_sha256":"%s","published":"%s"}\n' \
+    "$hostid" "$domains" "$mode" "$serial" "$notafter" "$fp" "$spki" "$(date -u +%FT%TZ)" > "$tmp/meta.json"
 
-  ( cd "$tmp" && sha256sum cert.pem chain.pem fullchain.pem privkey.pem meta.json > SHA256SUMS )
+  ( cd "$tmp" && sha256sum "${parts[@]}" > SHA256SUMS )
 
   chmod 0640 "$tmp"/*
   chmod 0644 "$tmp/meta.json" "$tmp/SHA256SUMS"
@@ -238,18 +287,20 @@ publish() {                  # $1=hostid  $2=stem  $3=domains (for meta)
   if [[ -d $dst ]]; then mv "$dst" "$dst.old"; fi
   mv "$tmp" "$dst"
   rm -rf "$dst.old"
-  log "$hostid: published (valid until $notafter, fp $fp)"
+  log "$hostid: published ${mode} (valid until $notafter, fp $fp)"
 }
 
 process_host() {
+  # 0 = done, 1 = failed, 2 = waiting for the agent (CSR mode, nothing to do yet)
   local conf="$1" hostid domains key_type threshold stem crt left cur new
+  local mode csr csr_cn_got
   hostid=$(basename "$conf" .conf)
   if [[ ! $hostid =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
     fail "host name not allowed: $hostid"; return 1
   fi
 
   # reset before sourcing, so one host's file does not leak into the next iteration
-  DOMAINS=""; KEY_TYPE=""; RENEW_DAYS=""; ENABLED="yes"; ACME_ZONE=""
+  DOMAINS=""; KEY_TYPE=""; RENEW_DAYS=""; ENABLED="yes"; ACME_ZONE=""; CSR_MODE=""
   # shellcheck source=/dev/null
   source "$conf"
   # ACME_ZONE from a host file only affects CNAME generation (certpull-host);
@@ -262,13 +313,56 @@ process_host() {
   domains="${DOMAINS// /, }"
   key_type="${KEY_TYPE:-$GLOBAL_KEY_TYPE}"
   threshold="${RENEW_DAYS:-$GLOBAL_RENEW_DAYS}"
+  mode=full; if [[ ${CSR_MODE,,} == yes ]]; then mode=csr; fi
 
-  local -a dargs=() d
-  for d in $DOMAINS; do dargs+=( --domains "$d" ); done
+  # Split DOMAINS with `read -ra`, never by leaving it unquoted.
+  #
+  # The main loop below sets `shopt -s nullglob` (it needs it for the
+  # hosts.d/*.conf glob), and an unquoted $DOMAINS is still subject to pathname
+  # expansion: under nullglob a wildcard domain such as *.lan.example.com
+  # matches no file and is DELETED from the list. A pure-wildcard host then
+  # called lego with no --domains at all, and a mixed list quietly lost its
+  # wildcard and got a certificate covering fewer names than configured.
+  local -a dlist=() dargs=() d
+  read -r -a dlist <<<"$DOMAINS"
+  for d in "${dlist[@]}"; do dargs+=( --domains "$d" ); done
 
   stem=$(lego_file_stem "${DOMAINS%% *}")
   crt="$LEGO_DIR/certificates/$stem.crt"
   left=$(days_left "$crt")
+
+  # --- CSR mode: the agent must have submitted a CSR first -------------------
+  # Skipped for --preflight, which only exercises the DNS delegation and must
+  # keep working before any agent has ever run.
+  csr=""
+  if [[ $mode == csr ]]; then csr="$CSR_DIR/$hostid.csr"; fi
+  if [[ $mode == csr ]] && (( ! PREONLY )); then
+    if [[ ! -s $csr ]]; then
+      # Not a failure: this is the normal state between "certpull-host add
+      # --csr" and the agent's first run. Treated as pending so a fleet
+      # bootstrap does not turn the renew timer red.
+      log "$hostid: CSR mode, waiting for the agent to submit a CSR ($csr)"
+      return 2
+    fi
+    # Re-checked here even though certpull-pull-shell already checked it at
+    # submit time: this is the process that calls the CA, so it does not trust a
+    # file on disk. DOMAINS may also have changed since the CSR was submitted.
+    if ! csr_check "$csr" "$DOMAINS"; then
+      fail "$hostid: the stored CSR is not valid for the current DOMAINS -- not calling lego"
+      echo "     the agent must submit a new one:  certpull-agent --submit   (on the LAN host)" >&2
+      notify "$hostid" "stored CSR no longer matches DOMAINS"
+      return 1
+    fi
+    # lego names its output files after the CSR's main domain, preferring the
+    # Subject CN. Our file lookup uses the first entry of DOMAINS, so a CSR with
+    # a different CN would make lego write files we never look at.
+    csr_cn_got=$(csr_cn "$csr")
+    if [[ -n $csr_cn_got && $csr_cn_got != "$(printf '%s' "${DOMAINS%% *}" | csr_norm_stream)" ]]; then
+      fail "$hostid: the CSR's CN is '$csr_cn_got', but the first domain is '${DOMAINS%% *}'"
+      echo "     lego would write its files under the CN -- have the agent rebuild the CSR" >&2
+      return 1
+    fi
+  fi
 
   local -a base=(
     lego
@@ -279,8 +373,15 @@ process_host() {
     --key-type "$key_type"
     --dns rfc2136
     --dns.resolvers "$DNS_RESOLVERS"
-    "${dargs[@]}"
   )
+  # --csr and --domains are mutually exclusive: lego exits with "Please specify
+  # either --domains/-d or --csr/-c, but not both". Both are GLOBAL flags, so
+  # they belong before the subcommand, which is where this array is expanded.
+  if [[ $mode == csr ]]; then
+    base+=( --csr "$csr" )
+  else
+    base+=( "${dargs[@]}" )
+  fi
   # By default lego checks propagation by asking the AUTHORITATIVE server
   # directly -- that is our own Knot, which will always answer "it is there".
   # Let's Encrypt resolves the name RECURSIVELY, so such a green result proves
@@ -289,14 +390,43 @@ process_host() {
   if [[ ${PROPAGATION_RNS:-yes} == yes ]]; then base+=( --dns.propagation-rns ); fi
   if (( PROPAGATION_WAIT > 0 )); then base+=( --dns.propagation-wait "${PROPAGATION_WAIT}s" ); fi
 
+  # Has this host been switched between modes since the last publication?
+  #
+  # Without this check nothing would happen: the certificate in lego's store is
+  # still fresh, so no renewal is due, and its fingerprint has not changed, so
+  # there is nothing to publish either -- and the pull directory would keep
+  # serving the old bundle, private key included, for weeks after somebody set
+  # CSR_MODE="yes". A mode change therefore forces a re-issue.
+  # The same reasoning applies to the DOMAINS list: adding a name to a host
+  # whose certificate is still fresh used to do nothing at all until the
+  # certificate came up for renewal weeks later, because no renewal was due and
+  # the fingerprint had not changed. Both are compared against what is actually
+  # published, which is the only record of what the agents are being served.
+  local pub_mode pub_domains force_local="$FORCE"
+  if [[ -s $PULL_DIR/$hostid/meta.json ]]; then
+    pub_mode=$(sed -n 's/.*"mode":"\([^"]*\)".*/\1/p' "$PULL_DIR/$hostid/meta.json" 2>/dev/null || true)
+    pub_domains=$(sed -n 's/.*"domains":"\([^"]*\)".*/\1/p' "$PULL_DIR/$hostid/meta.json" 2>/dev/null || true)
+    : "${pub_mode:=full}"      # a bundle published before modes existed
+    if [[ $pub_mode != "$mode" ]]; then
+      log "$hostid: mode changed ($pub_mode -> $mode) -> re-issuing so the published bundle matches"
+      force_local=1
+    fi
+    if [[ -n $pub_domains && $pub_domains != "$domains" ]]; then
+      log "$hostid: DOMAINS changed -> re-issuing"
+      log "    published: $pub_domains"
+      log "    configured: $domains"
+      force_local=1
+    fi
+  fi
+
   # Will we be calling lego at all?
   local need=0
-  if [[ ! -s $crt ]] || (( FORCE )) || (( left <= threshold )); then need=1; fi
+  if [[ ! -s $crt ]] || (( force_local )) || (( left <= threshold )); then need=1; fi
 
   if (( (need || PREONLY) && ! SKIP_PRE )); then
     local pre_ok=1
     check_zone_transaction "$ACME_ZONE" || pre_ok=0
-    for d in $DOMAINS; do
+    for d in "${dlist[@]}"; do
       preflight_domain "$d" || pre_ok=0
     done
     if (( ! pre_ok )); then
@@ -313,17 +443,21 @@ process_host() {
   # Clean zone before validating -- otherwise an old token from an interrupted
   # run can mask the new one for the duration of its TTL.
   if (( need )) && [[ ${PURGE_STALE_TXT:-yes} == yes ]]; then
-    for d in $DOMAINS; do purge_stale_txt "$d"; done
+    for d in "${dlist[@]}"; do purge_stale_txt "$d"; done
   fi
 
   if [[ ! -s $crt ]]; then
-    log "$hostid: no certificate yet -> issuing ($domains, $key_type)"
+    if [[ $mode == csr ]]; then
+      log "$hostid: no certificate yet -> signing the agent's CSR ($domains)"
+    else
+      log "$hostid: no certificate yet -> issuing ($domains, $key_type)"
+    fi
     if (( DRY )); then log "DRY: ${base[*]} run"; return 0; fi
     if ! "${base[@]}" run; then
       fail "$hostid: lego run failed"; notify "$hostid" "lego run failed"; return 1
     fi
-  elif (( FORCE )); then
-    log "$hostid: --force -> renewing (${left}d left)"
+  elif (( force_local )); then
+    log "$hostid: forced renewal (${left}d left)"
     if (( DRY )); then log "DRY: ${base[*]} renew --days 10000"; return 0; fi
     if ! "${base[@]}" renew --days 10000 --no-random-sleep; then
       fail "$hostid: forced renewal failed"; notify "$hostid" "forced renew failed"; return 1
@@ -343,16 +477,28 @@ process_host() {
   # publish when the fingerprint in pull differs from the one in lego's store
   new=$(openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
   cur=$(sed -n 's/.*"fingerprint_sha256":"\([^"]*\)".*/\1/p' "$PULL_DIR/$hostid/meta.json" 2>/dev/null || true)
-  if [[ -z $cur || $cur != "$new" ]]; then
+  # The mode is part of the condition as well: a bundle can be byte-identical in
+  # its certificate and still be wrong, because the old one carried a private
+  # key that must stop being served.
+  if [[ -z $cur || $cur != "$new" ]] || [[ -n $pub_mode && $pub_mode != "$mode" ]]; then
     # NOTE: process_host is called as `process_host ... || rc=1`, which
     # DISABLES set -e for the whole function body. A failure in `publish` will
     # therefore not abort anything by itself -- it has to be caught explicitly,
     # or the `return 0` below would report success for a certificate that never
     # reached the pull directory.
-    if ! publish "$hostid" "$stem" "$domains"; then
+    if ! publish "$hostid" "$stem" "$domains" "$mode" "$csr"; then
       fail "$hostid: the certificate exists, but publishing to $PULL_DIR failed"
       notify "$hostid" "publish failed"
       return 1
+    fi
+    # A host that has just moved into CSR mode may still have the private key
+    # from its full-mode days sitting in lego's store. Leaving it there would
+    # make the switch pointless: the whole claim of this mode is that no copy
+    # of the key exists on this machine.
+    if [[ $mode == csr && -e $LEGO_DIR/certificates/$stem.key ]]; then
+      shred -u "$LEGO_DIR/certificates/$stem.key" 2>/dev/null \
+        || rm -f "$LEGO_DIR/certificates/$stem.key"
+      log "$hostid: removed the old server-side private key left over from full mode"
     fi
   fi
   return 0
@@ -377,19 +523,24 @@ fi
 
 # A failure on one host does NOT abort the run -- every host is independent and
 # one broken CNAME must not block the renewal of all the others.
-ok_n=0; fail_n=0; failed=()
+#
+# process_host returns 2 for "waiting for the agent's CSR", which is a normal
+# bootstrap state and must not make the run fail: otherwise adding one CSR-mode
+# host would put the whole renew timer into a failed state until somebody
+# logged into that LAN machine.
+ok_n=0; fail_n=0; pend_n=0; failed=(); pending=()
 for f in "${files[@]}"; do
-  if process_host "$f"; then
-    (( ++ok_n ))
-  else
-    rc=1; (( ++fail_n )); failed+=( "$(basename "$f" .conf)" )
-  fi
+  rc_h=0; process_host "$f" || rc_h=$?
+  case "$rc_h" in
+    0) (( ++ok_n )) ;;
+    2) (( ++pend_n )); pending+=( "$(basename "$f" .conf)" ) ;;
+    *) rc=1; (( ++fail_n )); failed+=( "$(basename "$f" .conf)" ) ;;
+  esac
 done
 
-if (( fail_n )); then
-  log "summary: ${ok_n} OK, ${fail_n} failed -> ${failed[*]}"
-else
-  log "summary: ${ok_n} OK, no failures"
-fi
+summary="summary: ${ok_n} OK"
+if (( pend_n )); then summary+=", ${pend_n} waiting for a CSR -> ${pending[*]}"; fi
+if (( fail_n )); then summary+=", ${fail_n} failed -> ${failed[*]}"; else summary+=", no failures"; fi
+log "$summary"
 
 exit "$rc"

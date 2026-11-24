@@ -222,11 +222,11 @@ if [[ $arg == --all ]]; then
     load_host "$h" || continue
     [[ ${HOST_ENABLED,,} == yes ]] || continue
     printf '\n######## %s\n' "$h"
-    for d in $DOMS; do run_for "$d" "$ZONE_FOR_HOST"; done
+    read -r -a dlist <<<"$DOMS"; for d in "${dlist[@]}"; do run_for "$d" "$ZONE_FOR_HOST"; done
   done
 elif load_host "$arg"; then
   printf '\n######## %s\n' "$arg"
-  for d in $DOMS; do run_for "$d" "$ZONE_FOR_HOST"; done
+  read -r -a dlist <<<"$DOMS"; for d in "${dlist[@]}"; do run_for "$d" "$ZONE_FOR_HOST"; done
 else
   run_for "$arg" "$GLOBAL_ACME_ZONE"
 fi

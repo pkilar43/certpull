@@ -36,6 +36,19 @@ COMBINED="no"
 # Empty = check only what came in meta.json from the server.
 EXPECT_DOMAINS=""
 
+# --- Which side holds the private key ---------------------------------------
+# Empty (recommended) = follow the server. "yes"/"no" make it an assertion, so
+# a mismatch is an error rather than a silent move of the private key.
+#
+# csr mode: this machine generates its own key, it never leaves, and only a CSR
+# goes to the server. First certificate:  certpull-agent --submit  here, then
+# certpull-issue <hostid> on the server.
+CSR_MODE=""
+
+# The key this machine generates for itself in csr mode.
+# ec256 | ec384 | rsa2048 | rsa4096
+AGENT_KEY_TYPE="ec256"
+
 # Service reload. Without root this needs passwordless sudo restricted to a
 # single command -- the installer writes such a rule into /etc/sudoers.d/ when
 # you pass --reload-unit. If the agent only drops the files off and something

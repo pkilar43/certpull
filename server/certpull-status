@@ -8,18 +8,20 @@ CONF="${CERTPULL_CONF:-/etc/certpull/certpull.conf}"
 source "$CONF"
 : "${HOSTS_DIR:=/etc/certpull/hosts.d}" "${LEGO_DIR:=/var/lib/certpull/lego}"
 : "${PULL_DIR:=/var/lib/certpull/pull}" "${RENEW_DAYS:=15}"
+: "${CSR_DIR:=/var/lib/certpull/csr}"
 
 stem_of() { local d="$1"; if [[ $d == \*.* ]]; then d="_.${d#*.}"; fi; printf '%s' "$d"; }
 
-printf '%-22s %-8s %-6s %-10s %s\n' HOST STATE DAYS PUBLISHED DOMAINS
-printf '%-22s %-8s %-6s %-10s %s\n' '----' '-----' '----' '---------' '-------'
+printf '%-22s %-5s %-8s %-6s %-10s %s\n' HOST MODE STATE DAYS PUBLISHED DOMAINS
+printf '%-22s %-5s %-8s %-6s %-10s %s\n' '----' '----' '-----' '----' '---------' '-------'
 
 shopt -s nullglob
 for f in "$HOSTS_DIR"/*.conf; do
   hostid=$(basename "$f" .conf)
-  DOMAINS=""; ENABLED="yes"
+  DOMAINS=""; ENABLED="yes"; CSR_MODE=""
   # shellcheck source=/dev/null
   source "$f"
+  mode=full; if [[ ${CSR_MODE,,} == yes ]]; then mode=csr; fi
   crt="$LEGO_DIR/certificates/$(stem_of "${DOMAINS%% *}").crt"
 
   if [[ -s $crt ]]; then
@@ -36,10 +38,11 @@ for f in "$HOSTS_DIR"/*.conf; do
 
   state="ok"
   if [[ ${ENABLED,,} != yes ]]; then state="off"
+  elif [[ $mode == csr && ! -s $CSR_DIR/$hostid.csr ]]; then state="NOCSR"
   elif [[ $days == "-" ]]; then state="MISSING"
   elif (( days < 0 )); then state="EXPIRED"
   elif (( days <= RENEW_DAYS )); then state="renew"
   fi
 
-  printf '%-22s %-8s %-6s %-10s %s\n' "$hostid" "$state" "$days" "$pub" "$DOMAINS"
+  printf '%-22s %-5s %-8s %-6s %-10s %s\n' "$hostid" "$mode" "$state" "$days" "$pub" "$DOMAINS"
 done

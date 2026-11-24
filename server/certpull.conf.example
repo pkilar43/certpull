@@ -73,6 +73,16 @@ PURGE_STALE_TXT="yes"
 HOSTS_DIR="/etc/certpull/hosts.d"
 LEGO_DIR="/var/lib/certpull/lego"     # lego's internal state (ACME account, certs)
 PULL_DIR="/var/lib/certpull/pull"     # what the agents can see over SSH
+# Where agents in CSR mode drop their certificate signing requests. Written by
+# certpull-pull-shell as the unprivileged certpull account, read by
+# certpull-issue as root.
+#
+# certpull-pull-shell does NOT read this file (it runs as certpull, which cannot
+# read certpull.conf), so it falls back to the same default. If you move either
+# this or PULL_DIR, pass the new value to the forced command through
+# CERTPULL_CSR_DIR / CERTPULL_PULL_DIR -- `certpull-host doctor` warns when the
+# two have drifted apart.
+CSR_DIR="/var/lib/certpull/csr"
 LOG_TAG="certpull"
 
 # --- Notifications (optional) ----------------------------------------------
