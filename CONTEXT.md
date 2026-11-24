@@ -302,6 +302,7 @@ like something other than what it actually was.
 | A wildcard host getting a certificate covering fewer names than configured, or `lego` refusing to run at all with "Please specify --domains" | Our own bug, and it predated CSR mode: `for d in $DOMAINS` is subject to **pathname expansion**, and the scripts run with `shopt -s nullglob`, so `*.lan.example.com` matched no file and vanished from the list. A mixed list quietly lost its wildcard; a pure-wildcard host had no `--domains` left at all. Fixed by `read -r -a` everywhere (`certpull-issue`, `certpull-host cname`, `certpull-verify`, the agent's CSR builder and its `checkhost` loop). |
 | A host switched to `CSR_MODE="yes"` carrying on exactly as before, private key still published | Our own bug: no renewal was due and the fingerprint had not changed, so nothing was re-issued and nothing was re-published. The published **mode** and the published **domain list** are now part of the re-issue decision. The same hole made adding a name to `DOMAINS` a no-op until the natural renewal weeks later. |
 | An agent in a loop: a new key generated on every run, a CSR sent for it, and the certificate signed for the previous one never accepted | Our own bug: the "switched from full to csr, generate a fresh key" condition stayed true until a matching certificate was *installed*, so each run threw away the pending key the server was in the middle of signing. Fixed by never generating a second pending key while one exists (`--rotate-key` is the deliberate exception). |
+| Apache on the same machine stopping dead on port 443 right after `install-server.sh` ran | Our own bug, and the worst kind: the installer ran `ufw allow 22,53` and then `ufw --force enable`, so **every other port on the box was closed**. Nothing in the output mentioned it — the symptom was "the website stopped working", several steps away from the cause. It now reads `ss -tlnH`/`ss -ulnH` first and opens whatever is already listening, never re-enables an already active ufw, warns by name about enabled-but-stopped services whose ports it could not detect, and takes `--no-ufw`. `--show-firewall-plan` prints the decision without root and without changing anything. |
 | An agent happily serving a certificate that no longer covered the configured names after `DOMAINS` changed on the server | Nothing locally revealed it: key and certificate were a perfectly matching pair, just for the wrong name set. The server now reports `csr_state=ok\|stale\|missing` through the `config` verb, using the same `csr_check` that guards `submit`, and the agent resubmits on `stale`. |
 
 **The methodological takeaway:** with DNS-01, almost every symptom has a cause
@@ -322,6 +323,11 @@ that.
 * **Do not put `127.0.0.1` in `DNS_RESOLVERS`.**
 * **Do not add `NoNewPrivileges=yes`** to `certpull-agent@.service` while
   `RELOAD_CMD` uses `sudo` — sudo needs setuid.
+* **Do not enable a firewall without first opening what is already served.**
+  An installer that closes a port somebody else's service is using has broken
+  the machine, whatever the documentation says about dedicated hosts. The rule
+  generalises: before switching on anything that denies by default, enumerate
+  what is already working and permit it. See the ufw row in section 5.
 * **Do not let a client choose what it asks for.** The `hostid` comes from the
   forced command and the names come from `DOMAINS`; a client only ever supplies
   a verb and a hostid that must already be on its list. Any new verb has to

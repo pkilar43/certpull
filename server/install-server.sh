@@ -10,24 +10,88 @@
 # certpull account:
 #   ./install-server.sh --update
 #   ./install-server.sh --update --dry-run     show what it would do
+#
+# Firewall:
+#   --no-ufw                 do not install or touch ufw at all
+#   --show-firewall-plan     print which ports would be opened and exit
+#                            (needs no root, changes nothing)
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 LEGO_VERSION="${LEGO_VERSION:-4.31.0}"
 CONF_LIVE="/etc/certpull/certpull.conf"
 
-MODE=install; DRY=0
+# The ports certpull itself needs: SSH for the agents, DNS for the delegation.
+CERTPULL_PORTS=( 22/tcp 53/tcp 53/udp )
+
+MODE=install; DRY=0; WANT_UFW=1; PLAN_ONLY=0
 while [[ ${1:-} == --* ]]; do
   case "$1" in
     --update)  MODE=update; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --no-ufw)  WANT_UFW=0; shift ;;
+    --show-firewall-plan) PLAN_ONLY=1; shift ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 say() { printf '\n==> %s\n' "$*"; }
 run() { if (( DRY )); then printf '   [dry-run] %s\n' "$*"; else "$@"; fi; }
+
+# --- what else is listening on this machine ---------------------------------
+# Printed as "<port>/<proto>", one per line, sorted, loopback-only sockets
+# skipped because they need no firewall rule.
+#
+# This exists because of a real incident: the installer used to run
+# `ufw allow 22,53` followed by `ufw --force enable`, which on a machine that
+# also served HTTPS silently cut Apache off at port 443. The ufw output said
+# nothing about it; the symptom was "the website stopped working". Opening what
+# is already being served is the difference between configuring a firewall and
+# taking a service down.
+listening_ports() {
+  command -v ss >/dev/null || return 0
+  { ss -tlnH 2>/dev/null | awk '{print $4"/tcp"}'
+    ss -ulnH 2>/dev/null | awk '{print $4"/udp"}'
+  } | awk '
+    {
+      n = split($0, a, "/"); proto = a[n]
+      addr = $0; sub("/" proto "$", "", addr)
+      # strip a scope suffix such as 127.0.0.53%lo
+      sub(/%[^:]*$/, "", addr)
+      # loopback-only sockets are unreachable from outside anyway
+      if (addr ~ /^127\./)       next
+      if (addr ~ /^\[::1\]:/)    next
+      port = addr; sub(/.*:/, "", port)
+      if (port !~ /^[0-9]+$/)    next
+      print port "/" proto
+    }' | LC_ALL=C sort -u -t/ -k1,1n -k2,2
+}
+
+firewall_plan() {
+  # certpull's own ports plus everything else that is already being served.
+  { printf '%s\n' "${CERTPULL_PORTS[@]}"; listening_ports; } | LC_ALL=C sort -u -t/ -k1,1n -k2,2
+}
+
+other_ports() {
+  # What is listening that certpull did not ask for. comm needs lexically
+  # sorted input, so the numeric sort for display happens afterwards.
+  comm -13 <(printf '%s\n' "${CERTPULL_PORTS[@]}" | LC_ALL=C sort) \
+           <(listening_ports | LC_ALL=C sort) \
+    | LC_ALL=C sort -u -t/ -k1,1n -k2,2
+}
+
+if (( PLAN_ONLY )); then
+  echo "certpull needs:   ${CERTPULL_PORTS[*]}"
+  echo
+  echo "already listening on this machine (would also be allowed):"
+  mapfile -t extra < <(other_ports)
+  if ((${#extra[@]})); then printf '  %s\n' "${extra[@]}"; else echo "  (nothing else)"; fi
+  echo
+  echo "the full rule set would be:"
+  firewall_plan | sed 's/^/  ufw allow /'
+  exit 0
+fi
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
@@ -167,8 +231,11 @@ EMAIL="${3:?give the e-mail address for the ACME account}"
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends \
-  knot knot-dnsutils openssl ca-certificates curl tar dnsutils jq ufw
+PKGS=( knot knot-dnsutils openssl ca-certificates curl tar dnsutils jq )
+# ufw is only pulled in when we are actually going to manage it. Installing a
+# firewall on a machine whose firewall somebody else owns is not our business.
+if (( WANT_UFW )); then PKGS+=( ufw ); fi
+apt-get install -y --no-install-recommends "${PKGS[@]}"
 
 # --- lego -------------------------------------------------------------------
 if ! command -v lego >/dev/null 2>&1; then
@@ -323,12 +390,56 @@ install_units
 systemctl enable --now certpull-renew.timer
 
 # --- firewall ---------------------------------------------------------------
-say "ufw"
-ufw allow 22/tcp   >/dev/null
-ufw allow 53/udp   >/dev/null
-ufw allow 53/tcp   >/dev/null
-ufw --force enable >/dev/null
-ufw status numbered
+say "firewall"
+if (( ! WANT_UFW )); then
+  echo "   --no-ufw: not touching the firewall."
+  echo "   certpull needs these open from the internet: ${CERTPULL_PORTS[*]}"
+elif ! command -v ufw >/dev/null; then
+  echo "   ufw is not installed -- not touching the firewall."
+  echo "   open these yourself: ${CERTPULL_PORTS[*]}"
+else
+  was_active=0
+  if ufw status 2>/dev/null | grep -qi '^Status: active'; then was_active=1; fi
+
+  # Everything that is already being served gets a rule BEFORE the firewall is
+  # switched on, not after somebody notices it is gone.
+  mapfile -t plan < <(firewall_plan)
+  for p in "${plan[@]}"; do run ufw allow "$p" >/dev/null; done
+
+  mapfile -t others < <(other_ports)
+  printf '   certpull:  %s\n' "${CERTPULL_PORTS[*]}"
+  if ((${#others[@]})); then
+    printf '   kept open because something is already listening:  %s\n' "${others[*]}"
+  else
+    printf '   nothing else is listening on this machine\n'
+  fi
+
+  # A service that is installed but stopped right now does not show up in `ss`,
+  # so its port would not be opened. Worth saying out loud rather than
+  # discovering it the next time that service starts.
+  stopped=()
+  for u in apache2 nginx haproxy postfix dovecot exim4 mariadb mysql; do
+    if systemctl is-enabled "$u" >/dev/null 2>&1 \
+       && ! systemctl is-active "$u" >/dev/null 2>&1; then
+      stopped+=( "$u" )
+    fi
+  done
+  if ((${#stopped[@]})); then
+    cat >&2 <<EOF
+   WARNING: these services are enabled but NOT running, so their ports could
+   not be detected and have NOT been opened: ${stopped[*]}
+   Add them by hand before starting them, e.g.:  ufw allow 443/tcp
+EOF
+  fi
+
+  if (( was_active )); then
+    echo "   ufw was already active -- rules added, not re-enabling it"
+  else
+    echo "   enabling ufw with the rules above"
+    run ufw --force enable >/dev/null
+  fi
+  ufw status numbered || true
+fi
 
 # --- summary ----------------------------------------------------------------
 IP4=$(curl -fsS4 https://ifconfig.co 2>/dev/null || hostname -I | awk '{print $1}')

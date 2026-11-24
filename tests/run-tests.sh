@@ -462,6 +462,42 @@ for pat in SERVER SERVER_PORT HOSTID CSR_MODE; do
   grep -qE "^${pat}=" "$REPO/agent/agent.conf.user.example"; chk $? "install-agent sed target ${pat} exists in agent.conf.user.example"
 done
 
+hdr "17. firewall plan (install-server.sh --show-firewall-plan)"
+# A machine that also serves HTTPS, has a loopback-only database, and binds DNS
+# on both address families. Nothing here needs root and nothing is changed.
+cat > "$T/bin/ss" <<'SSEOF'
+#!/bin/sh
+case "$*" in
+  *-tlnH*) printf 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 *:443 *:*\nLISTEN 0 511 *:80 *:*\nLISTEN 0 4096 127.0.0.53%%lo:53 0.0.0.0:*\nLISTEN 0 70 127.0.0.1:3306 0.0.0.0:*\nLISTEN 0 4096 [::]:53 [::]:*\n' ;;
+  *-ulnH*) printf 'UNCONN 0 0 0.0.0.0:53 0.0.0.0:*\nUNCONN 0 0 127.0.0.53%%lo:53 0.0.0.0:*\n' ;;
+esac
+SSEOF
+chmod +x "$T/bin/ss"
+
+plan=$("$REPO/server/install-server.sh" --show-firewall-plan 2>&1); rc=$?
+[[ $rc == 0 ]]; chk $? "--show-firewall-plan runs without root and exits 0"
+echo "$plan" | grep -q 'ufw allow 443/tcp'; chk $? "a listening HTTPS port is in the plan"
+echo "$plan" | grep -q 'ufw allow 80/tcp';  chk $? "so is HTTP"
+echo "$plan" | grep -q 'ufw allow 22/tcp';  chk $? "certpull's own SSH port is there"
+echo "$plan" | grep -q 'ufw allow 53/tcp';  chk $? "and DNS tcp"
+echo "$plan" | grep -q 'ufw allow 53/udp';  chk $? "and DNS udp"
+echo "$plan" | grep -q '3306'; r=$?; [[ $r != 0 ]]; chk $? "a loopback-only port is NOT opened"
+[[ $(echo "$plan" | grep -c 'ufw allow 53/tcp') == 1 ]]; chk $? "0.0.0.0 and [::] on the same port are not duplicated"
+[[ $(echo "$plan" | grep -c 'ufw allow') == 5 ]]; chk $? "exactly the five expected rules"
+
+# Order matters for readability, and comm needs a different sort than display.
+[[ $(echo "$plan" | sed -n 's/^  ufw allow //p' | tr '\n' ' ') == "22/tcp 53/tcp 53/udp 80/tcp 443/tcp " ]]
+chk $? "the plan is sorted numerically by port"
+
+# No ss at all (a container, a stripped image): fall back to certpull's ports.
+plan=$(PATH="/usr/bin:/bin" "$REPO/server/install-server.sh" --show-firewall-plan 2>&1)
+echo "$plan" | grep -q '(nothing else)'; chk $? "without ss it detects nothing instead of guessing"
+[[ $(echo "$plan" | grep -c 'ufw allow') == 3 ]]; chk $? "and still plans certpull's own three ports"
+
+grep -q -- '--no-ufw' "$REPO/server/install-server.sh"; chk $? "--no-ufw exists"
+grep -q 'was_active' "$REPO/server/install-server.sh"; chk $? "an already-active ufw is not re-enabled"
+rm -f "$T/bin/ss"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 if [[ $KEEP == 0 && -d $T ]]; then rm -rf "$T"; else echo "sandbox kept at $T"; fi
 [[ $FAIL == 0 ]]

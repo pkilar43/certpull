@@ -80,7 +80,52 @@ git clone https://github.com/pkilar43/certpull.git /opt/certpull && cd /opt/cert
 
 The installer handles: packages, lego, the `certpull` user, directories, the
 TSIG key, Knot with the zone, `sshd_config.d/50-certpull.conf`, the timer and
-ufw (22/53).
+the firewall.
+
+It also **overwrites `/etc/knot/knot.conf`** (keeping a copy as
+`knot.conf.orig`) and **reloads sshd**. A dedicated VM is the intended home for
+this; if the machine does anything else, read the firewall note below first.
+
+#### The firewall
+
+certpull needs `22/tcp`, `53/tcp` and `53/udp` reachable from the internet. If
+ufw is going to be enabled, the installer first looks at what is **already
+listening** and opens that too — so putting this on a machine that also serves
+HTTPS does not take the website down. See exactly what it would do, as any
+user, before running it:
+
+```bash
+./install-server.sh --show-firewall-plan
+```
+
+```
+certpull needs:   22/tcp 53/tcp 53/udp
+
+already listening on this machine (would also be allowed):
+  80/tcp
+  443/tcp
+
+the full rule set would be:
+  ufw allow 22/tcp
+  ufw allow 53/tcp
+  ufw allow 53/udp
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+```
+
+If ufw is **already active**, the installer adds its rules and leaves it alone
+rather than re-enabling it. If your firewall is somebody else's (a cloud
+firewall, a managed appliance, nftables you maintain yourself), keep ufw out of
+it entirely — this also skips installing the package:
+
+```bash
+./install-server.sh --no-ufw acme.example.com ns-certpull.example.com pki@example.com
+```
+
+One case it cannot detect: a service that is installed and enabled but **not
+running right now** has no open socket, so its port is not opened. The
+installer warns about that by name; open those ports by hand before starting
+the service.
 
 ### 2. DNS delegation (once, at your DNS operator)
 
@@ -985,3 +1030,32 @@ certpull-host csr <hostid>              # on the server: the SPKI it has a CSR f
 owner; it belongs to the `certpull` account because the forced command writes
 there. `certpull-host doctor` checks it, and `./install-server.sh --update`
 fixes it.
+
+### After installing: another service on this machine stopped answering
+
+Almost certainly the firewall. Older versions of `install-server.sh` allowed
+only 22 and 53 and then ran `ufw --force enable`, which cut off everything else
+on the box — Apache on 443 being the obvious casualty. Current versions open
+whatever is already listening, but a service that was **stopped** at install
+time still needs its port added by hand:
+
+```bash
+sudo ufw status verbose
+sudo ufw allow 443/tcp
+sudo ufw allow 80/tcp
+```
+
+To tell the firewall apart from the service itself:
+
+```bash
+sudo ss -tlnp | grep ':443'      # still listening? then it is the firewall
+```
+
+If this machine's firewall is managed elsewhere, take ufw out of the picture
+entirely — the rules are kept, nothing is enforced:
+
+```bash
+sudo ufw disable
+```
+
+And check `./install-server.sh --show-firewall-plan` before the next install.
